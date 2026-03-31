@@ -557,6 +557,7 @@ impl AppState {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashSet;
 
     #[test]
     fn test_room_set_get_del() {
@@ -645,5 +646,303 @@ mod tests {
             .create_room_token(room_id, &["public".to_string()])
             .unwrap_err();
         assert!(matches!(err, StateError::JwtKeyTooShort));
+    }
+
+    #[test]
+    fn test_list_rooms_sorted() {
+        let mut app = AppState::new();
+        assert!(app.list_rooms().is_empty());
+
+        let r1 = app.create_room();
+        let r2 = app.create_room();
+        let r3 = app.create_room();
+        let rooms = app.list_rooms();
+        assert_eq!(rooms, vec![r1, r2, r3]);
+
+        app.delete_room(r2).unwrap();
+        assert_eq!(app.list_rooms(), vec![r1, r3]);
+    }
+
+    #[test]
+    fn test_room_info_ok_and_missing() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+
+        app.set_fragment(room_id, "public".into(), "k1".into(), json!(1))
+            .unwrap();
+        app.set_fragment(room_id, "public".into(), "k2".into(), json!(2))
+            .unwrap();
+        app.set_fragment(room_id, "private".into(), "k3".into(), json!(3))
+            .unwrap();
+
+        let info = app.room_info(room_id).unwrap();
+        assert_eq!(info["room_id"], json!(room_id));
+        assert_eq!(info["room_counter"], json!(3u64));
+        assert_eq!(info["container_count"], json!(2usize));
+        assert_eq!(info["fragment_count"], json!(3usize));
+
+        let err = app.room_info(999).unwrap_err();
+        assert!(matches!(err, StateError::RoomNotFound));
+    }
+
+    #[test]
+    fn test_metrics_fields() {
+        let mut app = AppState::new();
+        app.create_room();
+        app.total_ws_connections = 3;
+        app.ws_connection_count = 2;
+        app.ws_connection_latency_ns_total = 2_000_000; // 1ms avg
+
+        let m = app.metrics();
+        assert_eq!(m["room_count"], json!(1usize));
+        assert_eq!(m["ws_connections"], json!(3usize));
+        assert_eq!(m["ws_connection_avg_latency_ms"], json!(1.0f64));
+        assert_eq!(m["ws_connection_count"], json!(2u64));
+    }
+
+    #[test]
+    fn test_metrics_avg_latency_zero_when_no_connections() {
+        let app = AppState::new();
+        let m = app.metrics();
+        assert_eq!(m["ws_connection_avg_latency_ms"], json!(0.0f64));
+    }
+
+    #[test]
+    fn test_room_snapshot_filters_tombstones_and_containers() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+
+        app.set_fragment(room_id, "public".into(), "a".into(), json!(1))
+            .unwrap();
+        app.set_fragment(room_id, "public".into(), "b".into(), json!(2))
+            .unwrap();
+        app.del_fragment(room_id, "public".into(), "a".into())
+            .unwrap(); // tombstone
+
+        app.set_fragment(room_id, "secret".into(), "s".into(), json!("hidden"))
+            .unwrap();
+
+        let allowed: HashSet<String> = HashSet::new(); // only public
+        let snap = app.room_snapshot(room_id, &allowed).unwrap();
+
+        let containers = snap["containers"].as_object().unwrap();
+        assert_eq!(containers["public"]["b"], json!(2));
+        assert!(containers["public"].get("a").is_none(), "tombstoned key must be excluded");
+        assert!(containers.get("secret").is_none(), "disallowed container must be excluded");
+
+        // Non-existent room returns None
+        assert!(app.room_snapshot(999, &allowed).is_none());
+    }
+
+    #[test]
+    fn test_room_snapshot_allowed_extra_container() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        app.set_fragment(room_id, "priv".into(), "x".into(), json!(42))
+            .unwrap();
+
+        let mut allowed: HashSet<String> = HashSet::new();
+        allowed.insert("priv".to_string());
+
+        let snap = app.room_snapshot(room_id, &allowed).unwrap();
+        assert_eq!(snap["containers"]["priv"]["x"], json!(42));
+    }
+
+    #[test]
+    fn test_room_delta_up_to_date_returns_empty() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        app.set_fragment(room_id, "public".into(), "k".into(), json!(1))
+            .unwrap();
+
+        let allowed: HashSet<String> = HashSet::new();
+        let delta = app.room_delta(room_id, 1, &allowed).unwrap();
+        let containers = delta["containers"].as_object().unwrap();
+        assert!(containers.is_empty(), "delta since current version must be empty");
+    }
+
+    #[test]
+    fn test_room_delta_only_new_keys() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        app.set_fragment(room_id, "public".into(), "old".into(), json!(1))
+            .unwrap(); // version 1
+        app.set_fragment(room_id, "public".into(), "new".into(), json!(2))
+            .unwrap(); // version 2
+
+        let allowed: HashSet<String> = HashSet::new();
+        // Ask for delta since version 1: should only see "new"
+        let delta = app.room_delta(room_id, 1, &allowed).unwrap();
+        let pub_container = &delta["containers"]["public"];
+        assert_eq!(pub_container["new"], json!(2));
+        assert!(pub_container.get("old").is_none());
+    }
+
+    #[test]
+    fn test_room_delta_none_for_missing_room() {
+        let app = AppState::new();
+        let allowed: HashSet<String> = HashSet::new();
+        assert!(app.room_delta(999, 0, &allowed).is_none());
+    }
+
+    #[test]
+    fn test_room_version_missing_room() {
+        let app = AppState::new();
+        assert!(matches!(app.room_version(42), Err(StateError::RoomNotFound)));
+    }
+
+    #[test]
+    fn test_get_fragment_missing_container() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        let err = app.get_fragment(room_id, "no_such_container", "key").unwrap_err();
+        assert!(matches!(err, StateError::ContainerNotFound));
+    }
+
+    #[test]
+    fn test_get_fragment_missing_key() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        app.set_fragment(room_id, "public".into(), "x".into(), json!(1))
+            .unwrap();
+        let err = app.get_fragment(room_id, "public", "no_key").unwrap_err();
+        assert!(matches!(err, StateError::FragmentNotFound));
+    }
+
+    #[test]
+    fn test_del_fragment_missing_room() {
+        let app = AppState::new();
+        let err = app.del_fragment(99, "public".into(), "k".into()).unwrap_err();
+        assert!(matches!(err, StateError::RoomNotFound));
+    }
+
+    #[test]
+    fn test_del_fragment_missing_container() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        let err = app
+            .del_fragment(room_id, "no_such_container".into(), "k".into())
+            .unwrap_err();
+        assert!(matches!(err, StateError::ContainerNotFound));
+    }
+
+    #[test]
+    fn test_tx_not_open_errors() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+
+        assert!(matches!(app.tx_end(room_id), Err(StateError::TxNotOpen)));
+        // tx_abort on a room without open tx is tolerated (buffer is None, take() is None)
+        // but tx_abort returns Ok when there is nothing to abort? Let's confirm:
+        // Looking at implementation: room.tx_buffer = None is idempotent → Ok
+        assert!(app.tx_abort(room_id).is_ok());
+    }
+
+    #[test]
+    fn test_set_command_api_key_success() {
+        let mut app = AppState::new();
+        app.set_command_api_key("a-valid-key".to_string()).unwrap();
+        assert_eq!(app.command_api_key.as_deref(), Some("a-valid-key"));
+    }
+
+    #[test]
+    fn test_set_command_api_key_blank() {
+        let mut app = AppState::new();
+        assert!(matches!(
+            app.set_command_api_key("   ".to_string()),
+            Err(StateError::CommandApiKeyInvalid)
+        ));
+    }
+
+    #[test]
+    fn test_create_room_token_no_jwt_key() {
+        let mut app = AppState::new();
+        app.set_jwt_issuer("iss".to_string());
+        app.set_jwt_audience("aud".to_string());
+        let room_id = app.create_room();
+        let err = app.create_room_token(room_id, &[]).unwrap_err();
+        assert!(matches!(err, StateError::JwtKeyNotConfigured));
+    }
+
+    #[test]
+    fn test_create_room_token_no_issuer_audience() {
+        let mut app = AppState::new();
+        app.set_jwt_key("a".repeat(32));
+        let room_id = app.create_room();
+        let err = app.create_room_token(room_id, &[]).unwrap_err();
+        assert!(matches!(err, StateError::JwtIssuerAudienceNotConfigured));
+    }
+
+    #[test]
+    fn test_create_room_token_room_not_found() {
+        let mut app = AppState::new();
+        app.set_jwt_key("a".repeat(32));
+        app.set_jwt_issuer("iss".to_string());
+        app.set_jwt_audience("aud".to_string());
+        let err = app.create_room_token(999, &[]).unwrap_err();
+        assert!(matches!(err, StateError::RoomNotFound));
+    }
+
+    #[test]
+    fn test_create_room_token_success() {
+        let mut app = AppState::new();
+        app.set_jwt_key("a_long_enough_secret_key_32bytes_+".to_string());
+        app.set_jwt_issuer("syncpond".to_string());
+        app.set_jwt_audience("client".to_string());
+        let room_id = app.create_room();
+
+        let token = app
+            .create_room_token(room_id, &["priv".to_string()])
+            .unwrap();
+        // JWT format: three base64url parts separated by '.'
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts");
+    }
+
+    #[test]
+    fn test_create_room_token_monotone_timestamps() {
+        // Two tokens issued back-to-back should have different (non-equal) timestamps.
+        let mut app = AppState::new();
+        app.set_jwt_key("a_long_enough_secret_key_32bytes_+".to_string());
+        app.set_jwt_issuer("syncpond".to_string());
+        app.set_jwt_audience("client".to_string());
+        let room_id = app.create_room();
+
+        let t1 = app.create_room_token(room_id, &[]).unwrap();
+        let t2 = app.create_room_token(room_id, &[]).unwrap();
+        // Tokens may differ because the monotone clock bumps exp/iat
+        assert_ne!(t1, t2, "successive tokens should differ in timestamp");
+    }
+
+    #[test]
+    fn test_state_error_display() {
+        let cases = vec![
+            (StateError::RoomNotFound, "room_not_found"),
+            (StateError::ContainerNotFound, "container_not_found"),
+            (StateError::FragmentNotFound, "not_found"),
+            (StateError::FragmentTombstone, "tombstone"),
+            (StateError::TxNotOpen, "tx_not_open"),
+            (StateError::TxAlreadyOpen, "tx_already_open"),
+            (StateError::JwtKeyNotConfigured, "jwt_key_not_configured"),
+            (StateError::JwtIssuerAudienceNotConfigured, "jwt_issuer_audience_not_configured"),
+            (StateError::JwtKeyTooShort, "jwt_key_too_short"),
+            (StateError::CommandApiKeyInvalid, "command_api_key_invalid"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_set_jwt_config_helpers() {
+        let mut app = AppState::new();
+        app.set_jwt_key("mykey".to_string());
+        app.set_jwt_ttl(7200);
+        app.set_jwt_issuer("iss".to_string());
+        app.set_jwt_audience("aud".to_string());
+        assert_eq!(app.jwt_key.as_deref(), Some("mykey"));
+        assert_eq!(app.jwt_ttl_seconds, 7200);
+        assert_eq!(app.jwt_issuer.as_deref(), Some("iss"));
+        assert_eq!(app.jwt_audience.as_deref(), Some("aud"));
     }
 }

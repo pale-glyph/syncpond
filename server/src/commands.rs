@@ -563,4 +563,215 @@ mod tests {
         let result = app.set_command_api_key("".to_string());
         assert!(matches!(result, Err(StateError::CommandApiKeyInvalid)));
     }
+
+    #[tokio::test]
+    async fn test_room_list_and_delete() {
+        let state = sample_state();
+
+        // Empty list
+        let (resp, _) = process_command("ROOM.LIST", &state).await;
+        assert_eq!(resp, "OK []");
+
+        // Create two rooms
+        process_command("ROOM.CREATE", &state).await;
+        process_command("ROOM.CREATE", &state).await;
+
+        let (resp, _) = process_command("ROOM.LIST", &state).await;
+        assert!(resp.starts_with("OK "));
+        let ids: Vec<u64> = serde_json::from_str(&resp[3..]).unwrap();
+        assert_eq!(ids, vec![1u64, 2u64]);
+
+        // Delete room 1
+        let (resp, _) = process_command("ROOM.DELETE 1", &state).await;
+        assert_eq!(resp, "OK");
+
+        let (resp, _) = process_command("ROOM.LIST", &state).await;
+        let ids: Vec<u64> = serde_json::from_str(&resp[3..]).unwrap();
+        assert_eq!(ids, vec![2u64]);
+
+        // Delete non-existent room
+        let (resp, _) = process_command("ROOM.DELETE 999", &state).await;
+        assert_eq!(resp, "ERROR room_not_found");
+
+        // ROOM.DELETE with no room ID
+        let (resp, _) = process_command("ROOM.DELETE", &state).await;
+        assert_eq!(resp, "ERROR missing_argument");
+
+        // ROOM.LIST extra args
+        let (resp, _) = process_command("ROOM.LIST extra", &state).await;
+        assert_eq!(resp, "ERROR extra_arguments");
+    }
+
+    #[tokio::test]
+    async fn test_room_info_command() {
+        let state = sample_state();
+        process_command("ROOM.CREATE", &state).await;
+        process_command("SET 1 public k 42", &state).await;
+
+        let (resp, _) = process_command("ROOM.INFO 1", &state).await;
+        assert!(resp.starts_with("OK "));
+        let info: serde_json::Value = serde_json::from_str(&resp[3..]).unwrap();
+        assert_eq!(info["room_id"], serde_json::json!(1u64));
+        assert_eq!(info["room_counter"], serde_json::json!(1u64));
+        assert_eq!(info["fragment_count"], serde_json::json!(1usize));
+
+        // Non-existent room
+        let (resp, _) = process_command("ROOM.INFO 999", &state).await;
+        assert_eq!(resp, "ERROR room_not_found");
+
+        // Extra args
+        let (resp, _) = process_command("ROOM.INFO 1 extra", &state).await;
+        assert_eq!(resp, "ERROR extra_arguments");
+    }
+
+    #[tokio::test]
+    async fn test_version_command() {
+        let state = sample_state();
+        process_command("ROOM.CREATE", &state).await;
+
+        let (resp, _) = process_command("VERSION 1", &state).await;
+        assert_eq!(resp, "OK 0");
+
+        process_command("SET 1 public x 1", &state).await;
+
+        let (resp, _) = process_command("VERSION 1", &state).await;
+        assert_eq!(resp, "OK 1");
+
+        // Non-existent room
+        let (resp, _) = process_command("VERSION 999", &state).await;
+        assert_eq!(resp, "ERROR room_not_found");
+
+        // Extra args
+        let (resp, _) = process_command("VERSION 1 extra", &state).await;
+        assert_eq!(resp, "ERROR extra_arguments");
+    }
+
+    #[tokio::test]
+    async fn test_tx_abort_command() {
+        let state = sample_state();
+        process_command("ROOM.CREATE", &state).await;
+
+        process_command("TX.BEGIN 1", &state).await;
+        process_command("SET 1 public k 99", &state).await;
+
+        let (resp, _) = process_command("TX.ABORT 1", &state).await;
+        assert_eq!(resp, "OK");
+
+        // k should not be set
+        let (resp, _) = process_command("GET 1 public k", &state).await;
+        assert_eq!(resp, "ERROR container_not_found");
+
+        // Extra args
+        let (resp, _) = process_command("TX.ABORT 1 extra", &state).await;
+        assert_eq!(resp, "ERROR extra_arguments");
+    }
+
+    #[tokio::test]
+    async fn test_set_jwtkey_command() {
+        let state = sample_state();
+
+        let (resp, _) = process_command("SET.JWTKEY mysecretkey", &state).await;
+        assert_eq!(resp, "OK");
+
+        // Extra args after key
+        let (resp, _) = process_command("SET.JWTKEY k1 k2", &state).await;
+        assert_eq!(resp, "ERROR extra_arguments");
+
+        // Missing key
+        let (resp, _) = process_command("SET.JWTKEY", &state).await;
+        assert_eq!(resp, "ERROR missing_argument");
+    }
+
+    #[tokio::test]
+    async fn test_token_gen_success() {
+        let state = sample_state();
+        process_command("ROOM.CREATE", &state).await;
+
+        // Setup JWT key via command
+        process_command(
+            "SET.JWTKEY a_long_enough_secret_key_32bytes_+",
+            &state,
+        )
+        .await;
+        {
+            let mut app = state.write().await;
+            app.set_jwt_issuer("syncpond".to_string());
+            app.set_jwt_audience("client".to_string());
+        }
+
+        let (resp, _) = process_command("TOKEN.GEN 1 public priv", &state).await;
+        assert!(resp.starts_with("OK "), "expected OK got: {}", resp);
+        let token = &resp[3..];
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "token must be a valid JWT");
+    }
+
+    #[tokio::test]
+    async fn test_token_gen_invalid_room_id_non_numeric() {
+        let state = sample_state();
+
+        let (resp, _) = process_command("TOKEN.GEN notanumber", &state).await;
+        assert_eq!(resp, "ERROR invalid_room_id");
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_room_and_key() {
+        let state = sample_state();
+        process_command("ROOM.CREATE", &state).await;
+
+        // Missing room
+        let (resp, _) = process_command("GET 999 public foo", &state).await;
+        assert_eq!(resp, "ERROR room_not_found");
+
+        // Missing container
+        let (resp, _) = process_command("GET 1 no_container foo", &state).await;
+        assert_eq!(resp, "ERROR container_not_found");
+
+        // Missing key
+        process_command("SET 1 public existing 1", &state).await;
+        let (resp, _) = process_command("GET 1 public no_key", &state).await;
+        assert_eq!(resp, "ERROR not_found");
+    }
+
+    #[tokio::test]
+    async fn test_del_missing_room() {
+        let state = sample_state();
+
+        let (resp, _) = process_command("DEL 999 public foo", &state).await;
+        assert_eq!(resp, "ERROR room_not_found");
+    }
+
+    #[tokio::test]
+    async fn test_unknown_command() {
+        let state = sample_state();
+
+        let (resp, _) = process_command("NONEXISTENT.COMMAND arg1", &state).await;
+        assert_eq!(resp, "ERROR unknown_command");
+    }
+
+    #[tokio::test]
+    async fn test_empty_command_line() {
+        let state = sample_state();
+
+        // Completely empty
+        let (resp, _) = process_command("", &state).await;
+        assert_eq!(resp, "ERROR missing_argument");
+    }
+
+    #[tokio::test]
+    async fn test_set_on_nonexistent_room() {
+        let state = sample_state();
+
+        let (resp, _) = process_command("SET 999 public foo 1", &state).await;
+        assert_eq!(resp, "ERROR room_not_found");
+    }
+
+    #[tokio::test]
+    async fn test_room_delete_extra_args() {
+        let state = sample_state();
+        process_command("ROOM.CREATE", &state).await;
+
+        let (resp, _) = process_command("ROOM.DELETE 1 extra", &state).await;
+        assert_eq!(resp, "ERROR extra_arguments");
+    }
 }

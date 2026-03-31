@@ -4,18 +4,29 @@
   "description": "TypeScript shared client for Syncpond realtime sync server",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
     "clean": "rm -rf dist",
     "lint": "echo \"No lint configured\"",
-    "test": "echo \"No tests configured\""
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
-  "keywords": ["syncpond", "ws", "realtime", "client"],
+  "keywords": [
+    "syncpond",
+    "ws",
+    "realtime",
+    "client"
+  ],
   "author": "",
   "license": "MIT",
   "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@vitest/coverage-v8": "^4.1.2",
     "typescript": "^5.5.0",
-    "@types/node": "^20.11.0"
+    "vitest": "^4.1.2"
   }
 }

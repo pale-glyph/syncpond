@@ -675,4 +675,350 @@ mod tests {
         let update_msg = rx.recv().await.expect("should receive event");
         assert!(update_msg.get("room_id").is_some());
     }
+
+    #[tokio::test]
+    async fn test_ws_hub_add_client_limit() {
+        let state = Arc::new(RwLock::new(AppState::new()));
+        let mut hub = WsHub::new();
+        let room_id = 1u64;
+
+        // Fill up to the limit
+        for _ in 0..MAX_WS_CLIENTS_PER_ROOM {
+            let (tx, _rx) = mpsc::channel::<Value>(1);
+            hub.add_client(
+                room_id,
+                Uuid::new_v4(),
+                ClientInfo {
+                    allowed_containers: HashSet::new(),
+                    sender: tx,
+                },
+            )
+            .expect("should fit within limit");
+        }
+
+        // One more should be rejected
+        let (tx, _rx) = mpsc::channel::<Value>(1);
+        let result = hub.add_client(
+            room_id,
+            Uuid::new_v4(),
+            ClientInfo {
+                allowed_containers: HashSet::new(),
+                sender: tx,
+            },
+        );
+        assert!(result.is_err());
+        drop(state); // suppress unused warning
+    }
+
+    #[tokio::test]
+    async fn test_ws_hub_remove_client_cleans_up_empty_room() {
+        let mut hub = WsHub::new();
+        let (tx, _rx) = mpsc::channel::<Value>(1);
+        let client_id = Uuid::new_v4();
+        hub.add_client(
+            42,
+            client_id,
+            ClientInfo {
+                allowed_containers: HashSet::new(),
+                sender: tx,
+            },
+        )
+        .unwrap();
+
+        assert!(hub.rooms.contains_key(&42));
+        hub.remove_client(42, &client_id);
+        // Room entry should be removed when last client leaves
+        assert!(!hub.rooms.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn test_ws_hub_remove_nonexistent_client_is_noop() {
+        let mut hub = WsHub::new();
+        // Should not panic
+        hub.remove_client(999, &Uuid::new_v4());
+    }
+
+    #[tokio::test]
+    async fn test_ws_hub_default() {
+        let hub = WsHub::default();
+        assert!(hub.rooms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_update_wildcard_sends_room_update_event() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        let state = Arc::new(RwLock::new(app));
+
+        let mut hub = WsHub::new();
+        let (tx, mut rx) = mpsc::channel::<Value>(4);
+        hub.add_client(
+            room_id,
+            Uuid::new_v4(),
+            ClientInfo {
+                allowed_containers: HashSet::new(),
+                sender: tx,
+            },
+        )
+        .unwrap();
+
+        hub.broadcast_update(
+            RoomUpdate {
+                room_id,
+                container: "*".to_string(),
+                key: "*".to_string(),
+                value: None,
+                room_counter: 5,
+            },
+            &RateLimiter::new(),
+            100,
+            60,
+            &state,
+        )
+        .await;
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg["type"], "room_update");
+        assert_eq!(msg["room_counter"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_update_deleted_sends_deleted_flag() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        let state = Arc::new(RwLock::new(app));
+
+        let mut hub = WsHub::new();
+        let (tx, mut rx) = mpsc::channel::<Value>(4);
+        hub.add_client(
+            room_id,
+            Uuid::new_v4(),
+            ClientInfo {
+                allowed_containers: HashSet::new(),
+                sender: tx,
+            },
+        )
+        .unwrap();
+
+        hub.broadcast_update(
+            RoomUpdate {
+                room_id,
+                container: "public".to_string(),
+                key: "foo".to_string(),
+                value: None, // None with non-wildcard = deleted
+                room_counter: 3,
+            },
+            &RateLimiter::new(),
+            100,
+            60,
+            &state,
+        )
+        .await;
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg["type"], "update");
+        assert_eq!(msg["deleted"], true);
+        assert!(msg.get("value").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_update_private_container_filtered_for_unallowed_client() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        let state = Arc::new(RwLock::new(app));
+
+        let mut hub = WsHub::new();
+        let (tx, mut rx) = mpsc::channel::<Value>(4);
+        // Client only has access to "public", not "secret"
+        let allowed: HashSet<String> = HashSet::new();
+        hub.add_client(
+            room_id,
+            Uuid::new_v4(),
+            ClientInfo {
+                allowed_containers: allowed,
+                sender: tx,
+            },
+        )
+        .unwrap();
+
+        hub.broadcast_update(
+            RoomUpdate {
+                room_id,
+                container: "secret".to_string(),
+                key: "key".to_string(),
+                value: Some(json!(42)),
+                room_counter: 1,
+            },
+            &RateLimiter::new(),
+            100,
+            60,
+            &state,
+        )
+        .await;
+
+        // Channel should be empty — update was filtered
+        assert!(rx.try_recv().is_err(), "private update must not be sent to unallowed client");
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_update_disconnects_rate_limited_client() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        let state = Arc::new(RwLock::new(app));
+
+        let mut hub = WsHub::new();
+        let (tx, _rx) = mpsc::channel::<Value>(4);
+        let client_id = Uuid::new_v4();
+        hub.add_client(
+            room_id,
+            client_id,
+            ClientInfo {
+                allowed_containers: HashSet::new(),
+                sender: tx,
+            },
+        )
+        .unwrap();
+
+        // Use a rate limiter with limit=0 so every attempt is denied
+        let rate_limiter = RateLimiter::new();
+
+        hub.broadcast_update(
+            RoomUpdate {
+                room_id,
+                container: "public".to_string(),
+                key: "k".to_string(),
+                value: Some(json!(1)),
+                room_counter: 1,
+            },
+            &rate_limiter,
+            0, // limit of 0 = always denied
+            60,
+            &state,
+        )
+        .await;
+
+        // Client should have been disconnected, room entry removed
+        assert!(!hub.rooms.contains_key(&room_id));
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_update_disconnects_closed_channel_client() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        let state = Arc::new(RwLock::new(app));
+
+        let mut hub = WsHub::new();
+        let (tx, rx) = mpsc::channel::<Value>(4);
+        // Drop the receiver so the channel is closed
+        drop(rx);
+
+        hub.add_client(
+            room_id,
+            Uuid::new_v4(),
+            ClientInfo {
+                allowed_containers: HashSet::new(),
+                sender: tx,
+            },
+        )
+        .unwrap();
+
+        hub.broadcast_update(
+            RoomUpdate {
+                room_id,
+                container: "public".to_string(),
+                key: "k".to_string(),
+                value: Some(json!(1)),
+                room_counter: 1,
+            },
+            &RateLimiter::new(),
+            100,
+            60,
+            &state,
+        )
+        .await;
+
+        // Client should be removed after channel closed error
+        assert!(!hub.rooms.contains_key(&room_id));
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_update_disconnects_full_queue_client() {
+        let mut app = AppState::new();
+        let room_id = app.create_room();
+        let state = Arc::new(RwLock::new(app));
+
+        let mut hub = WsHub::new();
+        // Channel capacity = 0 (bounded mpsc with cap 0 isn't supported; use cap 1 and pre-fill)
+        let (tx, _rx) = mpsc::channel::<Value>(1);
+        // Pre-fill the channel so it's full
+        tx.try_send(json!({"prefill": true})).unwrap();
+
+        hub.add_client(
+            room_id,
+            Uuid::new_v4(),
+            ClientInfo {
+                allowed_containers: HashSet::new(),
+                sender: tx,
+            },
+        )
+        .unwrap();
+
+        hub.broadcast_update(
+            RoomUpdate {
+                room_id,
+                container: "public".to_string(),
+                key: "k".to_string(),
+                value: Some(json!(1)),
+                room_counter: 1,
+            },
+            &RateLimiter::new(),
+            100,
+            60,
+            &state,
+        )
+        .await;
+
+        // Client should be removed after queue full error
+        assert!(!hub.rooms.contains_key(&room_id));
+    }
+
+    #[tokio::test]
+    async fn test_validate_jwt_claims_no_jwt_key() {
+        let app = AppState::new(); // no jwt key configured
+        let err = validate_jwt_claims(&app, "any.token.value").unwrap_err();
+        assert_eq!(err, "no_jwt_key");
+    }
+
+    #[tokio::test]
+    async fn test_validate_jwt_claims_invalid_room_non_numeric() {
+        let mut app = AppState::new();
+        app.set_jwt_key("secretsecretsecretsecretsecretsecret".to_string());
+
+        #[derive(Debug, Serialize)]
+        struct BadRoomClaims {
+            sub: String,
+            room: String,
+            exp: usize,
+        }
+
+        let claims = BadRoomClaims {
+            sub: "room:abc".into(),
+            room: "abc".into(), // non-numeric room
+            exp: (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600) as usize,
+        };
+
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret("secretsecretsecretsecretsecretsecret".as_ref()),
+        )
+        .unwrap();
+
+        let err = validate_jwt_claims(&app, &token).unwrap_err();
+        assert_eq!(err, "invalid_jwt_room");
+    }
 }
