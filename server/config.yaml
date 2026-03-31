@@ -1,0 +1,9 @@
+# syncpond-server configuration
+# Update command_api_key with your real secret before production.
+command_api_key: "fake-api-key-123456"
+ws_addr: "0.0.0.0:8080"
+command_addr: "0.0.0.0:9090"
+jwt_key: PnmQDa4lVP21w6G2skYJSIVntLPCcdupfoiLKe8ZU8c9FTmXDeEdm0oHSmwD9LL3
+jwt_issuer: syncpond-server
+jwt_audience: syncpond
+jwt_ttl_seconds: 3600
