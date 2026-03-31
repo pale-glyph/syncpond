@@ -169,7 +169,7 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
                             room_id,
                             container,
                             key,
-                            value: Some(serde_json::Value::Null),
+                            value: None,
                             room_counter,
                         }],
                     )
@@ -260,7 +260,16 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
             match app.tx_end(room_id) {
                 Ok(()) => {
                     let room_counter = app.room_version(room_id).unwrap_or(0);
-                    ("OK".into(), vec![RoomUpdate { room_id, container: "*".to_string(), key: "*".to_string(), value: None, room_counter }])
+                    (
+                        "OK".into(),
+                        vec![RoomUpdate {
+                            room_id,
+                            container: "*".to_string(),
+                            key: "*".to_string(),
+                            value: None,
+                            room_counter,
+                        }],
+                    )
                 }
                 Err(e) => (error_of(e), vec![]),
             }
@@ -299,7 +308,7 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
                     Err(err) => return (err, vec![]),
                 }
             }
-            let app = state.read().await;
+            let mut app = state.write().await;
             match app.create_room_token(room_id, &containers) {
                 Ok(token) => (format!("OK {}", token), vec![]),
                 Err(e) => (error_of(e), vec![]),
@@ -416,7 +425,11 @@ mod tests {
         let state = sample_state();
         process_command("ROOM.CREATE", &state).await;
 
-        let (resp, updates) = process_command("SET 1 \"my container\" \"complex key\" {\"a\": \"hello world\", \"b\": 123}", &state).await;
+        let (resp, updates) = process_command(
+            "SET 1 \"my container\" \"complex key\" {\"a\": \"hello world\", \"b\": 123}",
+            &state,
+        )
+        .await;
         assert_eq!(resp, "OK");
         assert_eq!(updates.len(), 1);
 
@@ -551,4 +564,3 @@ mod tests {
         assert!(matches!(result, Err(StateError::CommandApiKeyInvalid)));
     }
 }
-

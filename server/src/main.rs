@@ -14,9 +14,9 @@ mod ws;
 use crate::commands::process_command;
 use crate::rate_limiter::RateLimiter;
 use crate::state::{AppState, SharedState};
-use crate::ws::{handle_ws_connection, WsHub};
+use crate::ws::{WsHub, handle_ws_connection};
 use anyhow::{Context, Result};
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use tokio::{
@@ -25,7 +25,6 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 use tracing::{error, info};
-
 
 #[derive(Debug, Deserialize)]
 struct SyncpondConfig {
@@ -56,7 +55,8 @@ struct SyncpondConfig {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let config_path = std::env::var("SYNCPOND_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
+    let config_path =
+        std::env::var("SYNCPOND_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
     let config_text = fs::read_to_string(config_path)?;
     let config: SyncpondConfig = serde_yaml::from_str(&config_text)?;
 
@@ -85,23 +85,38 @@ async fn main() -> Result<()> {
     let command_rate_limiter = Arc::new(RateLimiter::new());
     let command_auth_rate_limiter = Arc::new(RateLimiter::new());
 
-    let ws_update_rate_limiter_for_ws = ws_update_rate_limiter.clone();
     let ws_update_rate_limiter_for_cmd = ws_update_rate_limiter.clone();
     let ws_room_rate_limiter_for_ws = ws_room_rate_limiter.clone();
     let ws_room_rate_limiter_for_cmd = ws_room_rate_limiter.clone();
 
     let cmd_rate_limit = config.command_rate_limit.unwrap_or(DEFAULT_CMD_RATE_LIMIT);
-    let cmd_rate_window_secs = config.command_rate_window_secs.unwrap_or(DEFAULT_CMD_RATE_WINDOW_SECS);
-    let ws_auth_rate_limit = config.ws_auth_rate_limit.unwrap_or(DEFAULT_WS_AUTH_RATE_LIMIT);
-    let ws_auth_rate_window_secs = config.ws_auth_rate_window_secs.unwrap_or(DEFAULT_WS_AUTH_RATE_WINDOW_SECS);
-    let ws_update_rate_limit = config.ws_update_rate_limit.unwrap_or(DEFAULT_WS_UPDATE_RATE_LIMIT);
-    let ws_update_rate_window_secs = config.ws_update_rate_window_secs.unwrap_or(DEFAULT_WS_UPDATE_RATE_WINDOW_SECS);
-    let ws_room_rate_limit = config.ws_room_rate_limit.unwrap_or(DEFAULT_WS_ROOM_RATE_LIMIT);
-    let ws_room_rate_window_secs = config.ws_room_rate_window_secs.unwrap_or(DEFAULT_WS_ROOM_RATE_WINDOW_SECS);
-    let ws_allowed_origins = config
-        .ws_allowed_origins
-        .clone()
-        .unwrap_or_else(|| DEFAULT_WS_ALLOWED_ORIGINS.iter().map(|s| s.to_string()).collect());
+    let cmd_rate_window_secs = config
+        .command_rate_window_secs
+        .unwrap_or(DEFAULT_CMD_RATE_WINDOW_SECS);
+    let ws_auth_rate_limit = config
+        .ws_auth_rate_limit
+        .unwrap_or(DEFAULT_WS_AUTH_RATE_LIMIT);
+    let ws_auth_rate_window_secs = config
+        .ws_auth_rate_window_secs
+        .unwrap_or(DEFAULT_WS_AUTH_RATE_WINDOW_SECS);
+    let ws_update_rate_limit = config
+        .ws_update_rate_limit
+        .unwrap_or(DEFAULT_WS_UPDATE_RATE_LIMIT);
+    let ws_update_rate_window_secs = config
+        .ws_update_rate_window_secs
+        .unwrap_or(DEFAULT_WS_UPDATE_RATE_WINDOW_SECS);
+    let ws_room_rate_limit = config
+        .ws_room_rate_limit
+        .unwrap_or(DEFAULT_WS_ROOM_RATE_LIMIT);
+    let ws_room_rate_window_secs = config
+        .ws_room_rate_window_secs
+        .unwrap_or(DEFAULT_WS_ROOM_RATE_WINDOW_SECS);
+    let ws_allowed_origins = config.ws_allowed_origins.clone().unwrap_or_else(|| {
+        DEFAULT_WS_ALLOWED_ORIGINS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    });
 
     let command_auth_rate_limit = config
         .command_auth_rate_limit
@@ -116,12 +131,20 @@ async fn main() -> Result<()> {
 
     let require_tls = config.require_tls.unwrap_or(false);
     if require_tls {
-        anyhow::bail!("TLS transport required in config, but this binary does not terminate TLS; use reverse proxy for TLS termination");
+        anyhow::bail!(
+            "TLS transport required in config, but this binary does not terminate TLS; use reverse proxy for TLS termination"
+        );
     }
 
-    let ws_addr = config.ws_addr.unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let command_addr = config.command_addr.unwrap_or_else(|| "127.0.0.1:9090".to_string());
-    let health_addr = config.health_addr.unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let ws_addr = config
+        .ws_addr
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let command_addr = config
+        .command_addr
+        .unwrap_or_else(|| "127.0.0.1:9090".to_string());
+    let health_addr = config
+        .health_addr
+        .unwrap_or_else(|| "127.0.0.1:7070".to_string());
     let health_bind_loopback_only = config.health_bind_loopback_only.unwrap_or(true);
 
     let ws_addr: SocketAddr = ws_addr
@@ -149,15 +172,19 @@ async fn main() -> Result<()> {
     let command_addr_for_task = command_addr.clone();
 
     let ws_server = tokio::spawn(async move {
-        let listener = TcpListener::bind(ws_addr_for_task).await.context("ws bind failed")?;
-        info!("syncpond websocket server listening on {}", ws_addr_for_task);
+        let listener = TcpListener::bind(ws_addr_for_task)
+            .await
+            .context("ws bind failed")?;
+        info!(
+            "syncpond websocket server listening on {}",
+            ws_addr_for_task
+        );
 
         loop {
             let (stream, peer) = listener.accept().await?;
             let state = ws_state.clone();
             let hub = ws_hub_for_ws.clone();
             let auth_limiter = ws_auth_rate_limiter.clone();
-            let update_limiter = ws_update_rate_limiter_for_ws.clone();
             let room_limiter = ws_room_rate_limiter_for_ws.clone();
             let ws_allowed_origins_for_conn = ws_allowed_origins.clone();
             tokio::spawn(async move {
@@ -167,12 +194,9 @@ async fn main() -> Result<()> {
                     state,
                     hub,
                     auth_limiter,
-                    update_limiter,
                     room_limiter,
                     ws_auth_rate_limit,
                     ws_auth_rate_window_secs,
-                    ws_update_rate_limit,
-                    ws_update_rate_window_secs,
                     ws_allowed_origins_for_conn,
                 )
                 .await
@@ -187,8 +211,13 @@ async fn main() -> Result<()> {
     });
 
     let command_server = tokio::spawn(async move {
-        let listener = TcpListener::bind(command_addr_for_task).await.context("cmd bind failed")?;
-        info!("syncpond command socket listening on {}", command_addr_for_task);
+        let listener = TcpListener::bind(command_addr_for_task)
+            .await
+            .context("cmd bind failed")?;
+        info!(
+            "syncpond command socket listening on {}",
+            command_addr_for_task
+        );
 
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -231,8 +260,13 @@ async fn main() -> Result<()> {
     let health_state = shared_state.clone();
     let health_addr_for_task = health_addr.clone();
     let health_server = tokio::spawn(async move {
-        info!("syncpond health server listening on {}", health_addr_for_task);
-        let listener = TcpListener::bind(health_addr_for_task).await.context("health bind failed")?;
+        info!(
+            "syncpond health server listening on {}",
+            health_addr_for_task
+        );
+        let listener = TcpListener::bind(health_addr_for_task)
+            .await
+            .context("health bind failed")?;
 
         loop {
             let (stream, peer) = listener.accept().await?;
@@ -254,7 +288,9 @@ async fn main() -> Result<()> {
     });
 
     let shutdown = async {
-        tokio::signal::ctrl_c().await.context("failed to listen for ctrl-c")?;
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for ctrl-c")?;
         info!("shutdown signal received");
         Ok::<(), anyhow::Error>(())
     };
@@ -285,12 +321,18 @@ const DEFAULT_COMMAND_AUTH_RATE_LIMIT: usize = 5;
 const DEFAULT_COMMAND_AUTH_RATE_WINDOW_SECS: u64 = 60;
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
     if a.len() != b.len() {
-        return false;
+        // Run the loop anyway to avoid leaking length via timing.
+        let mut diff = 1u8;
+        for (x, y) in a.iter().zip(a.iter()) {
+            diff |= x ^ y;
+        }
+        return diff != 0; // always true, timing-similar to equal-length case
     }
-
     let mut diff = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
+    for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -301,17 +343,30 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     line.clear();
-    let bytes = reader.read_line(line).await?;
-    if line.len() > MAX_COMMAND_LINE_LEN {
-        anyhow::bail!("line_too_long");
+    let mut total = 0usize;
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            break;
+        }
+        let newline_pos = buf.iter().position(|&b| b == b'\n');
+        let consume_len = newline_pos.map(|p| p + 1).unwrap_or(buf.len());
+        total += consume_len;
+        if total > MAX_COMMAND_LINE_LEN {
+            anyhow::bail!("line_too_long");
+        }
+        let chunk = std::str::from_utf8(&buf[..consume_len])
+            .map_err(|e| anyhow::anyhow!("invalid utf8: {}", e))?;
+        line.push_str(chunk);
+        reader.consume(consume_len);
+        if newline_pos.is_some() {
+            break;
+        }
     }
-    Ok(bytes)
+    Ok(total)
 }
 
-async fn handle_health_connection(
-    stream: TcpStream,
-    state: SharedState,
-) -> Result<()> {
+async fn handle_health_connection(stream: TcpStream, state: SharedState) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
@@ -328,7 +383,10 @@ async fn handle_health_connection(
             "/health" => ("200 OK", "ok".to_string()),
             "/metrics" => {
                 let app = state.read().await;
-                ("200 OK", serde_json::to_string(&app.metrics()).unwrap_or_else(|_| "{}".into()))
+                (
+                    "200 OK",
+                    serde_json::to_string(&app.metrics()).unwrap_or_else(|_| "{}".into()),
+                )
             }
             _ => ("404 Not Found", "not found".to_string()),
         }
@@ -360,14 +418,22 @@ fn html_escape(input: &str) -> String {
 }
 
 fn make_doc_index_html() -> String {
-    let mut html = String::from("<html><head><title>syncpond docs</title></head><body><h1>syncpond docs</h1><ul>");
+    let mut html = String::from(
+        "<html><head><title>syncpond docs</title></head><body><h1>syncpond docs</h1><ul>",
+    );
     for entry in DOC_DIR.entries() {
         if let Some(path) = entry.path().to_str() {
             let escaped = html_escape(path);
             if entry.as_dir().is_some() {
-                html.push_str(&format!("<li><a href=\"/docs/{}\">{}/</a></li>", escaped, escaped));
+                html.push_str(&format!(
+                    "<li><a href=\"/docs/{}\">{}/</a></li>",
+                    escaped, escaped
+                ));
             } else if entry.as_file().is_some() {
-                html.push_str(&format!("<li><a href=\"/docs/{}\">{}</a></li>", escaped, escaped));
+                html.push_str(&format!(
+                    "<li><a href=\"/docs/{}\">{}</a></li>",
+                    escaped, escaped
+                ));
             }
         }
     }
@@ -386,29 +452,45 @@ async fn serve_docs_connection(mut stream: TcpStream, request: &str) -> Result<(
     } else if let Some(stripped) = path.strip_prefix("/docs/") {
         if let Some(file) = DOC_DIR.get_file(stripped) {
             let content = file.contents_utf8().unwrap_or_default().to_string();
-            let content_type = if Path::new(stripped).extension().and_then(|e| e.to_str()) == Some("md") {
-                "text/markdown; charset=utf-8"
-            } else {
-                "text/plain; charset=utf-8"
-            };
+            let content_type =
+                if Path::new(stripped).extension().and_then(|e| e.to_str()) == Some("md") {
+                    "text/markdown; charset=utf-8"
+                } else {
+                    "text/plain; charset=utf-8"
+                };
             ("200 OK", content_type, content)
         } else if let Some(dir) = DOC_DIR.get_dir(stripped) {
-            let mut html = format!("<html><head><title>{}</title></head><body><h1>Index of {}</h1><ul>", path, path);
+            let mut html = format!(
+                "<html><head><title>{}</title></head><body><h1>Index of {}</h1><ul>",
+                path, path
+            );
             for entry in dir.entries() {
                 if let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) {
                     let escaped = html_escape(name);
                     let href = format!("{}/{}", path.trim_end_matches('/'), escaped);
-                    let label = if entry.as_dir().is_some() { format!("{}/", escaped) } else { escaped.clone() };
+                    let label = if entry.as_dir().is_some() {
+                        format!("{}/", escaped)
+                    } else {
+                        escaped.clone()
+                    };
                     html.push_str(&format!("<li><a href=\"{}\">{}</a></li>", href, label));
                 }
             }
             html.push_str("</ul></body></html>");
             ("200 OK", "text/html; charset=utf-8", html)
         } else {
-            ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string())
+            (
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "not found".to_string(),
+            )
         }
     } else {
-        ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string())
+        (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found".to_string(),
+        )
     };
 
     let response = format!(
@@ -429,12 +511,9 @@ async fn handle_ws_or_docs_connection(
     state: SharedState,
     ws_hub: Arc<Mutex<WsHub>>,
     auth_rate_limiter: Arc<RateLimiter>,
-    ws_update_rate_limiter: Arc<RateLimiter>,
     ws_room_rate_limiter: Arc<RateLimiter>,
     ws_auth_rate_limit: usize,
     ws_auth_rate_window_secs: u64,
-    ws_update_rate_limit: usize,
-    ws_update_rate_window_secs: u64,
     ws_allowed_origins: Vec<String>,
 ) -> Result<()> {
     let mut peek_buf = [0u8; 16384];
@@ -458,12 +537,9 @@ async fn handle_ws_or_docs_connection(
         state,
         ws_hub,
         auth_rate_limiter,
-        ws_update_rate_limiter,
         ws_room_rate_limiter,
         ws_auth_rate_limit,
         ws_auth_rate_window_secs,
-        ws_update_rate_limit,
-        ws_update_rate_window_secs,
         ws_allowed_origins,
     )
     .await
@@ -489,7 +565,11 @@ async fn handle_command_connection(
 ) -> Result<()> {
     let key = peer.ip().to_string();
     let allowed = rate_limiter
-        .allow(&key, cmd_rate_limit, Duration::from_secs(cmd_rate_window_secs))
+        .allow(
+            &key,
+            cmd_rate_limit,
+            Duration::from_secs(cmd_rate_window_secs),
+        )
         .await;
     if !allowed {
         info!(%peer, "command rate limit exceeded");
@@ -497,7 +577,11 @@ async fn handle_command_connection(
     }
 
     let auth_allowed = command_auth_rate_limiter
-        .allow(&key, command_auth_rate_limit, Duration::from_secs(command_auth_rate_window_secs))
+        .allow(
+            &key,
+            command_auth_rate_limit,
+            Duration::from_secs(command_auth_rate_window_secs),
+        )
         .await;
     if !auth_allowed {
         info!(%peer, "command auth rate limit exceeded");
@@ -576,7 +660,10 @@ async fn handle_command_connection(
         if resp.starts_with("ERROR") {
             let mut app = state.write().await;
             app.command_error_count = app.command_error_count.saturating_add(1);
-            if resp.starts_with("ERROR invalid_") || resp == "ERROR unknown_command" || resp == "ERROR missing_argument" {
+            if resp.starts_with("ERROR invalid_")
+                || resp == "ERROR unknown_command"
+                || resp == "ERROR missing_argument"
+            {
                 app.invalid_command_count = app.invalid_command_count.saturating_add(1);
             }
         }
@@ -606,11 +693,18 @@ async fn handle_command_connection(
             for update in updates {
                 let room_key = format!("room:{}", update.room_id);
                 let room_allowed = ws_room_rate_limiter
-                    .allow(&room_key, ws_room_rate_limit, std::time::Duration::from_secs(ws_room_rate_window_secs))
+                    .allow(
+                        &room_key,
+                        ws_room_rate_limit,
+                        std::time::Duration::from_secs(ws_room_rate_window_secs),
+                    )
                     .await;
 
                 if !room_allowed {
-                    info!(room_id = update.room_id, "room-level ws update rate limit exceeded");
+                    info!(
+                        room_id = update.room_id,
+                        "room-level ws update rate limit exceeded"
+                    );
                     continue;
                 }
 
@@ -620,6 +714,7 @@ async fn handle_command_connection(
                     &ws_update_rate_limiter,
                     ws_update_rate_limit,
                     ws_update_rate_window_secs,
+                    &state,
                 )
                 .await;
             }
@@ -629,5 +724,3 @@ async fn handle_command_connection(
     info!(%peer, "command disconnected");
     Ok(())
 }
-
-

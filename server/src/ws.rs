@@ -1,15 +1,20 @@
+use crate::commands::RoomUpdate;
 use crate::rate_limiter::RateLimiter;
 use crate::state::{AppState, SharedState};
-use crate::commands::RoomUpdate;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::{collections::{HashMap, HashSet}, net::SocketAddr, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     net::TcpStream,
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
 };
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -40,7 +45,12 @@ impl WsHub {
     }
 
     /// Add a client to the room hub if room size limits allow.
-    pub fn add_client(&mut self, room_id: u64, client_id: Uuid, client: ClientInfo) -> Result<(), &'static str> {
+    pub fn add_client(
+        &mut self,
+        room_id: u64,
+        client_id: Uuid,
+        client: ClientInfo,
+    ) -> Result<(), &'static str> {
         let room_clients = self.rooms.entry(room_id).or_insert_with(HashMap::new);
         if room_clients.len() >= MAX_WS_CLIENTS_PER_ROOM {
             return Err("room_client_limit_exceeded");
@@ -65,13 +75,14 @@ impl WsHub {
     }
 
     /// Broadcast a room update event to interested WS clients with per-client backpressure protection.
-pub async fn broadcast_update(
-    &mut self,
-    update: RoomUpdate,
-    ws_update_rate_limiter: &RateLimiter,
-    ws_update_rate_limit: usize,
-    ws_update_rate_window_secs: u64,
-) {
+    pub async fn broadcast_update(
+        &mut self,
+        update: RoomUpdate,
+        ws_update_rate_limiter: &RateLimiter,
+        ws_update_rate_limit: usize,
+        ws_update_rate_window_secs: u64,
+        state: &SharedState,
+    ) {
         let event = if update.container == "*" && update.key == "*" {
             json!({
                 "type": "room_update",
@@ -115,10 +126,18 @@ pub async fn broadcast_update(
 
             let client_key = format!("{}:{}", update.room_id, client_id);
             if !ws_update_rate_limiter
-                .allow(&client_key, ws_update_rate_limit, Duration::from_secs(ws_update_rate_window_secs))
+                .allow(
+                    &client_key,
+                    ws_update_rate_limit,
+                    Duration::from_secs(ws_update_rate_window_secs),
+                )
                 .await
             {
                 error!(room_id = update.room_id, client = ?client_id, "ws client update rate limited, dropping client");
+                {
+                    let mut app = state.write().await;
+                    app.ws_update_rate_limited = app.ws_update_rate_limited.saturating_add(1);
+                }
                 disconnected.push(*client_id);
                 continue;
             }
@@ -127,6 +146,10 @@ pub async fn broadcast_update(
                 match err {
                     mpsc::error::TrySendError::Full(_) => {
                         error!(room_id = update.room_id, client = ?client_id, "ws client queue full, dropping client");
+                        {
+                            let mut app = state.write().await;
+                            app.ws_update_dropped = app.ws_update_dropped.saturating_add(1);
+                        }
                         disconnected.push(*client_id);
                     }
                     mpsc::error::TrySendError::Closed(_) => {
@@ -146,6 +169,12 @@ pub async fn broadcast_update(
     }
 }
 
+impl Default for WsHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -161,7 +190,6 @@ pub struct AuthMessage {
     pub jwt: String,
     pub last_seen_counter: Option<u64>,
 }
-
 
 fn validate_jwt_claims(app: &AppState, token: &str) -> Result<Claims, String> {
     let jwt_key = app
@@ -181,11 +209,18 @@ fn validate_jwt_claims(app: &AppState, token: &str) -> Result<Claims, String> {
         validation.set_audience(&[audience]);
     }
 
-    let token_data = decode::<Claims>(token, &DecodingKey::from_secret(jwt_key.as_ref()), &validation)
-        .map_err(|e| format!("invalid_jwt:{}", e))?;
+    let token_data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(jwt_key.as_ref()),
+        &validation,
+    )
+    .map_err(|e| format!("invalid_jwt:{}", e))?;
 
     let claims = token_data.claims;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as usize;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as usize;
     if claims.exp <= now {
         return Err("expired_jwt".to_string());
     }
@@ -212,17 +247,18 @@ pub async fn handle_ws_connection(
     state: SharedState,
     ws_hub: Arc<Mutex<WsHub>>,
     auth_rate_limiter: Arc<RateLimiter>,
-    _ws_update_rate_limiter: Arc<RateLimiter>,
     _ws_room_rate_limiter: Arc<RateLimiter>,
     ws_auth_rate_limit: usize,
     ws_auth_rate_window_secs: u64,
-    _ws_update_rate_limit: usize,
-    _ws_update_rate_window_secs: u64,
     ws_allowed_origins: Vec<String>,
 ) -> Result<()> {
     let key = peer.ip().to_string();
     let allowed = auth_rate_limiter
-        .allow(&key, ws_auth_rate_limit, Duration::from_secs(ws_auth_rate_window_secs))
+        .allow(
+            &key,
+            ws_auth_rate_limit,
+            Duration::from_secs(ws_auth_rate_window_secs),
+        )
         .await;
     if !allowed {
         info!(%peer, "ws auth rate limit exceeded");
@@ -322,11 +358,8 @@ pub async fn handle_ws_connection(
 
     let _last_seen_counter = auth_msg.last_seen_counter;
 
-    let mut allowed_containers: HashSet<String> = claims
-        .containers
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let mut allowed_containers: HashSet<String> =
+        claims.containers.unwrap_or_default().into_iter().collect();
     allowed_containers.insert("public".to_string());
 
     let room_state_snapshot = {
@@ -376,7 +409,10 @@ pub async fn handle_ws_connection(
     {
         let mut app = state.write().await;
         app.total_ws_connections = app.total_ws_connections.saturating_add(1);
-        info!(total_ws_connections = app.total_ws_connections, "ws connections after auth");
+        info!(
+            total_ws_connections = app.total_ws_connections,
+            "ws connections after auth"
+        );
     }
 
     loop {
@@ -410,6 +446,10 @@ pub async fn handle_ws_connection(
                     Some(event) => {
                         if let Err(err) = ws_sender.send(Message::Text(event.to_string())).await {
                             error!(%err, "ws outgoing error");
+                            {
+                                let mut app = state.write().await;
+                                app.ws_send_errors = app.ws_send_errors.saturating_add(1);
+                            }
                             break;
                         }
                     }
@@ -428,9 +468,15 @@ pub async fn handle_ws_connection(
         let mut app = state.write().await;
         app.total_ws_connections = app.total_ws_connections.saturating_sub(1);
         let elapsed_ns = connection_start.elapsed().as_nanos();
-        app.ws_connection_latency_ns_total = app.ws_connection_latency_ns_total.saturating_add(elapsed_ns);
+        app.ws_connection_latency_ns_total = app
+            .ws_connection_latency_ns_total
+            .saturating_add(elapsed_ns);
         app.ws_connection_count += 1;
-        info!(total_ws_connections = app.total_ws_connections, ws_connection_elapsed_ms = elapsed_ns as f64 / 1_000_000.0, "ws connections after close");
+        info!(
+            total_ws_connections = app.total_ws_connections,
+            ws_connection_elapsed_ms = elapsed_ns as f64 / 1_000_000.0,
+            "ws connections after close"
+        );
     }
 
     Ok(())
@@ -440,10 +486,10 @@ pub async fn handle_ws_connection(
 mod tests {
     use super::*;
     use crate::state::AppState;
-    use jsonwebtoken::{encode, Header};
+    use jsonwebtoken::{Header, encode};
     use serde::Serialize;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::{RwLock, mpsc};
 
     #[derive(Debug, Serialize)]
     struct IncompleteClaims {
@@ -471,7 +517,11 @@ mod tests {
         let mut app = AppState::new();
         app.set_jwt_key("secretsecretsecretsecretsecretsecret".to_string());
 
-        let past = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 3600;
+        let past = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
 
         #[derive(Debug, Serialize)]
         struct ExpiredClaims {
@@ -488,7 +538,12 @@ mod tests {
             exp: past as usize,
         };
 
-        let token = encode(&Header::default(), &claims, &jsonwebtoken::EncodingKey::from_secret("secret".as_ref())).unwrap();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret("secret".as_ref()),
+        )
+        .unwrap();
         let err = validate_jwt_claims(&app, &token).unwrap_err();
         assert!(err.contains("expired_jwt") || err.contains("invalid_jwt"));
     }
@@ -504,7 +559,12 @@ mod tests {
             containers: vec!["public".into()],
         };
 
-        let token = encode(&Header::default(), &claims, &jsonwebtoken::EncodingKey::from_secret("secret".as_ref())).unwrap();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret("secret".as_ref()),
+        )
+        .unwrap();
         let err = validate_jwt_claims(&app, &token).unwrap_err();
         assert!(err.contains("invalid_jwt"));
     }
@@ -532,12 +592,21 @@ mod tests {
             sub: format!("room:{}-bad", room_id),
             room: room_id.to_string(),
             containers: vec!["public".into()],
-            exp: (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600) as usize,
+            exp: (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600) as usize,
             iss: Some("my-issuer".to_string()),
             aud: Some("my-aud".to_string()),
         };
 
-        let token = encode(&Header::default(), &claims, &jsonwebtoken::EncodingKey::from_secret(app.jwt_key.as_ref().unwrap().as_ref())).unwrap();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(app.jwt_key.as_ref().unwrap().as_ref()),
+        )
+        .unwrap();
         let err = validate_jwt_claims(&app, &token).unwrap_err();
         assert_eq!(err, "invalid_jwt_sub");
     }
@@ -550,7 +619,15 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<Value>(1);
         let client_id = Uuid::new_v4();
-        hub.add_client(123, client_id, ClientInfo { allowed_containers: allowed.clone(), sender: tx }).expect("add client");
+        hub.add_client(
+            123,
+            client_id,
+            ClientInfo {
+                allowed_containers: allowed.clone(),
+                sender: tx,
+            },
+        )
+        .expect("add client");
         assert!(hub.rooms.contains_key(&123));
 
         hub.remove_room(123);
@@ -576,13 +653,22 @@ mod tests {
         let mut allowed = HashSet::new();
         allowed.insert("public".to_string());
         let (tx, mut rx) = mpsc::channel::<Value>(3);
-        hub.add_client(1, Uuid::new_v4(), ClientInfo { allowed_containers: allowed, sender: tx }).unwrap();
+        hub.add_client(
+            1,
+            Uuid::new_v4(),
+            ClientInfo {
+                allowed_containers: allowed,
+                sender: tx,
+            },
+        )
+        .unwrap();
 
         hub.broadcast_update(
             updates.into_iter().next().unwrap(),
             &RateLimiter::new(),
             100,
             60,
+            &state,
         )
         .await;
 

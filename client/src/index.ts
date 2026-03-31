@@ -14,10 +14,11 @@ import {
 export class SyncpondClient {
   public readonly url: string;
   public readonly jwt: string;
-  public readonly lastSeenCounter?: number;
   public readonly autoReconnect: boolean;
   public readonly reconnectIntervalMs: number;
   public readonly maxReconnectAttempts: number;
+
+  private lastSeenCounter?: number;
 
   private ws?: WebSocket;
   private connecting = false;
@@ -127,7 +128,7 @@ export class SyncpondClient {
       try {
         listener(payload);
       } catch (error) {
-        /* swallow listener errors */
+        console.error("SyncpondClient listener error:", error);
       }
     });
   }
@@ -174,9 +175,11 @@ export class SyncpondClient {
         this.emit("auth_error", message as SyncpondAuthError);
         break;
       case "room_update":
+        this.lastSeenCounter = (message as SyncpondRoomUpdate).room_counter;
         this.emit("room_update", message as SyncpondRoomUpdate);
         break;
       case "update":
+        this.lastSeenCounter = (message as SyncpondUpdate).room_counter;
         this.emit("update", message as SyncpondUpdate);
         break;
       default:

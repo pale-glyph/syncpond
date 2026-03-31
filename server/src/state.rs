@@ -1,7 +1,11 @@
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::{HashMap, HashSet}, sync::{Arc, RwLock as StdRwLock}, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock as StdRwLock},
+    time::SystemTime,
+};
 use tokio::sync::RwLock;
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -21,8 +25,15 @@ pub struct RoomState {
 
 #[derive(Debug)]
 pub enum RoomCommand {
-    Set { container: String, key: String, value: Value },
-    Del { container: String, key: String },
+    Set {
+        container: String,
+        key: String,
+        value: Value,
+    },
+    Del {
+        container: String,
+        key: String,
+    },
 }
 
 /// Error conditions used by application state operations.
@@ -69,7 +80,9 @@ impl std::fmt::Display for StateError {
             StateError::TxNotOpen => write!(f, "tx_not_open"),
             StateError::TxAlreadyOpen => write!(f, "tx_already_open"),
             StateError::JwtKeyNotConfigured => write!(f, "jwt_key_not_configured"),
-            StateError::JwtIssuerAudienceNotConfigured => write!(f, "jwt_issuer_audience_not_configured"),
+            StateError::JwtIssuerAudienceNotConfigured => {
+                write!(f, "jwt_issuer_audience_not_configured")
+            }
             StateError::JwtKeyTooShort => write!(f, "jwt_key_too_short"),
             StateError::CommandApiKeyInvalid => write!(f, "command_api_key_invalid"),
         }
@@ -179,26 +192,29 @@ impl AppState {
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
 
         if let Some(buffer) = room.tx_buffer.as_mut() {
-            buffer.push(RoomCommand::Set { container, key, value });
+            buffer.push(RoomCommand::Set {
+                container,
+                key,
+                value,
+            });
             return Ok(());
         }
 
         room.room_counter += 1;
         let key_version = room.room_counter;
         let container_map = room.containers.entry(container).or_default();
-        container_map.insert(
-            key,
-            FragmentEntry {
-                value,
-                key_version,
-            },
-        );
+        container_map.insert(key, FragmentEntry { value, key_version });
 
         Ok(())
     }
 
     /// Delete (tombstone) a fragment key in a room container.
-    pub fn del_fragment(&self, room_id: u64, container: String, key: String) -> Result<(), StateError> {
+    pub fn del_fragment(
+        &self,
+        room_id: u64,
+        container: String,
+        key: String,
+    ) -> Result<(), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
 
@@ -225,7 +241,12 @@ impl AppState {
     }
 
     /// Get fragment value and version for a given key in room/container.
-    pub fn get_fragment(&self, room_id: u64, container: &str, key: &str) -> Result<(Value, u64), StateError> {
+    pub fn get_fragment(
+        &self,
+        room_id: u64,
+        container: &str,
+        key: &str,
+    ) -> Result<(Value, u64), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
         let container_map = room
@@ -328,8 +349,15 @@ impl AppState {
     }
 
     /// Generate a JWT for a room with granted containers.
-    pub fn create_room_token(&self, room_id: u64, containers: &[String]) -> Result<String, StateError> {
-        let key = self.jwt_key.as_ref().ok_or(StateError::JwtKeyNotConfigured)?;
+    pub fn create_room_token(
+        &mut self,
+        room_id: u64,
+        containers: &[String],
+    ) -> Result<String, StateError> {
+        let key = self
+            .jwt_key
+            .as_ref()
+            .ok_or(StateError::JwtKeyNotConfigured)?;
         if key.len() < 32 {
             return Err(StateError::JwtKeyTooShort);
         }
@@ -360,6 +388,7 @@ impl AppState {
         } else {
             now
         };
+        self.last_jwt_issue_seconds = Some(now);
 
         let exp = now.saturating_add(self.jwt_ttl_seconds);
 
@@ -382,8 +411,12 @@ impl AppState {
             aud: self.jwt_audience.clone(),
         };
 
-        encode(&Header::default(), &claims, &EncodingKey::from_secret(key.as_bytes()))
-            .map_err(|_| StateError::JwtKeyNotConfigured)
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(key.as_bytes()),
+        )
+        .map_err(|_| StateError::JwtKeyNotConfigured)
     }
 
     /// Begin a transaction for a room, buffering subsequent SET/DEL operations.
@@ -405,17 +438,15 @@ impl AppState {
 
         for op in buffer.drain(..) {
             match op {
-                RoomCommand::Set { container, key, value } => {
+                RoomCommand::Set {
+                    container,
+                    key,
+                    value,
+                } => {
                     room.room_counter += 1;
                     let key_version = room.room_counter;
                     let container_map = room.containers.entry(container).or_default();
-                    container_map.insert(
-                        key,
-                        FragmentEntry {
-                            value,
-                            key_version,
-                        },
-                    );
+                    container_map.insert(key, FragmentEntry { value, key_version });
                 }
                 RoomCommand::Del { container, key } => {
                     // For semantics, DEL in a transaction always tombstones the key, even if it did
@@ -446,7 +477,11 @@ impl AppState {
     }
 
     /// Get a snapshot of room state for allowed containers.
-    pub fn room_snapshot(&self, room_id: u64, allowed_containers: &std::collections::HashSet<String>) -> Option<serde_json::Value> {
+    pub fn room_snapshot(
+        &self,
+        room_id: u64,
+        allowed_containers: &std::collections::HashSet<String>,
+    ) -> Option<serde_json::Value> {
         let room_arc = self.rooms.get(&room_id)?;
         let room = room_arc.read().ok()?;
         let mut containers_json = serde_json::Map::new();
@@ -455,9 +490,14 @@ impl AppState {
             if container_name == "public" || allowed_containers.contains(container_name) {
                 let mut container_map = serde_json::Map::new();
                 for (key, entry) in fragments {
-                    container_map.insert(key.clone(), entry.value.clone());
+                    if !entry.value.is_null() {
+                        container_map.insert(key.clone(), entry.value.clone());
+                    }
                 }
-                containers_json.insert(container_name.clone(), serde_json::Value::Object(container_map));
+                containers_json.insert(
+                    container_name.clone(),
+                    serde_json::Value::Object(container_map),
+                );
             }
         }
 
@@ -499,7 +539,10 @@ impl AppState {
             }
 
             if !container_map.is_empty() {
-                containers_json.insert(container_name.clone(), serde_json::Value::Object(container_map));
+                containers_json.insert(
+                    container_name.clone(),
+                    serde_json::Value::Object(container_map),
+                );
             }
         }
 
@@ -523,14 +566,16 @@ mod tests {
         assert_eq!(room_id, 1);
         assert_eq!(app.room_version(room_id).unwrap(), 0);
 
-        app.set_fragment(room_id, "public".into(), "foo".into(), json!("bar")).unwrap();
+        app.set_fragment(room_id, "public".into(), "foo".into(), json!("bar"))
+            .unwrap();
         assert_eq!(app.room_version(room_id).unwrap(), 1);
 
         let (value, kv) = app.get_fragment(room_id, "public", "foo").unwrap();
         assert_eq!(value, json!("bar"));
         assert_eq!(kv, 1);
 
-        app.del_fragment(room_id, "public".into(), "foo".into()).unwrap();
+        app.del_fragment(room_id, "public".into(), "foo".into())
+            .unwrap();
         assert_eq!(app.room_version(room_id).unwrap(), 2);
 
         let err = app.get_fragment(room_id, "public", "foo").unwrap_err();
@@ -543,10 +588,15 @@ mod tests {
         let room_id = app.create_room();
 
         app.tx_begin(room_id).unwrap();
-        assert!(matches!(app.tx_begin(room_id), Err(StateError::TxAlreadyOpen)));
+        assert!(matches!(
+            app.tx_begin(room_id),
+            Err(StateError::TxAlreadyOpen)
+        ));
 
-        app.set_fragment(room_id, "public".into(), "a".into(), json!(1)).unwrap();
-        app.del_fragment(room_id, "public".into(), "missing".into()).unwrap();
+        app.set_fragment(room_id, "public".into(), "a".into(), json!(1))
+            .unwrap();
+        app.del_fragment(room_id, "public".into(), "missing".into())
+            .unwrap();
 
         // not applied until tx_end
         let maybe = app.get_fragment(room_id, "public", "a");
@@ -563,7 +613,8 @@ mod tests {
         assert!(matches!(err, StateError::FragmentTombstone));
 
         app.tx_begin(room_id).unwrap();
-        app.set_fragment(room_id, "public".into(), "a".into(), json!(2)).unwrap();
+        app.set_fragment(room_id, "public".into(), "a".into(), json!(2))
+            .unwrap();
         app.tx_abort(room_id).unwrap();
 
         let (value, kv) = app.get_fragment(room_id, "public", "a").unwrap();
@@ -576,7 +627,10 @@ mod tests {
         let mut app = AppState::new();
         let room_id = app.create_room();
         assert!(app.delete_room(room_id).is_ok());
-        assert!(matches!(app.delete_room(room_id), Err(StateError::RoomNotFound)));
+        assert!(matches!(
+            app.delete_room(room_id),
+            Err(StateError::RoomNotFound)
+        ));
     }
 
     #[test]
@@ -587,8 +641,9 @@ mod tests {
         app.set_jwt_audience("audience".to_string());
 
         let room_id = app.create_room();
-        let err = app.create_room_token(room_id, &["public".to_string()]).unwrap_err();
+        let err = app
+            .create_room_token(room_id, &["public".to_string()])
+            .unwrap_err();
         assert!(matches!(err, StateError::JwtKeyTooShort));
     }
 }
-

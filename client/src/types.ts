@@ -2,7 +2,8 @@ export type SyncpondContainer = string;
 export type SyncpondKey = string;
 
 export interface SyncpondRoomSnapshot {
-  [container: string]: Record<SyncpondKey, unknown>;
+  room_counter: number;
+  containers: { [container: string]: Record<SyncpondKey, unknown> };
 }
 
 export interface SyncpondAuthMessage {
