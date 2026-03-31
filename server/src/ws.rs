@@ -18,7 +18,7 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const MAX_WS_CLIENTS_PER_ROOM: usize = 200;
@@ -198,6 +198,8 @@ fn validate_jwt_claims(app: &AppState, token: &str) -> Result<Claims, String> {
         .ok_or_else(|| "no_jwt_key".to_string())?;
 
     let mut validation = Validation::new(Algorithm::HS256);
+    // Explicitly lock algorithms to prevent algorithm confusion attacks.
+    validation.algorithms = vec![Algorithm::HS256];
     // Explicitly require `exp` and enforce expiration.
     validation.set_required_spec_claims(&["exp"]);
     validation.validate_exp = true;
@@ -261,7 +263,7 @@ pub async fn handle_ws_connection(
         )
         .await;
     if !allowed {
-        info!(%peer, "ws auth rate limit exceeded");
+        warn!(%peer, "ws auth rate limit exceeded");
         return Ok(());
     }
 
@@ -304,6 +306,7 @@ pub async fn handle_ws_connection(
         Some(Ok(_)) => {
             let mut app = state.write().await;
             app.ws_auth_failure += 1;
+            warn!(%peer, reason = "invalid_auth_message", "ws auth failure");
             let err = json!({"type":"auth_error","reason":"invalid_auth_message"});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
             return Ok(());
@@ -317,6 +320,7 @@ pub async fn handle_ws_connection(
         Err(_) => {
             let mut app = state.write().await;
             app.ws_auth_failure += 1;
+            warn!(%peer, reason = "invalid_json", "ws auth failure");
             let err = json!({"type":"auth_error","reason":"invalid_json"});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
             return Ok(());
@@ -326,6 +330,7 @@ pub async fn handle_ws_connection(
     if auth_msg.typ != "auth" {
         let mut app = state.write().await;
         app.ws_auth_failure += 1;
+        warn!(%peer, reason = "missing_auth", "ws auth failure");
         let err = json!({"type":"auth_error","reason":"missing_auth"});
         ws_sender.send(Message::Text(err.to_string())).await.ok();
         return Ok(());
@@ -342,6 +347,7 @@ pub async fn handle_ws_connection(
         Err(reason) => {
             let mut app = state.write().await;
             app.ws_auth_failure += 1;
+            warn!(%peer, %reason, "ws auth failure: invalid_jwt");
             let err = json!({"type":"auth_error","reason":"invalid_jwt","detail": reason});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
             return Ok(());

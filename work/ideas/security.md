@@ -2,7 +2,7 @@
 
 ---
 
-## 1. Replace hand-rolled `constant_time_eq` with `subtle` crate
+## ✅ 1. Replace hand-rolled `constant_time_eq` with `subtle` crate
 
 **File:** `server/src/main.rs`
 
@@ -23,7 +23,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 ---
 
-## 2. Command API should default to loopback-only binding
+## ✅ 2. Command API should default to loopback-only binding
 
 **File:** `server/example/config.yaml`
 
@@ -38,7 +38,7 @@ The `main.rs` docs already warn about this, but it should be enforced at the exa
 
 ---
 
-## 3. No idle / connection timeout on command TCP connections
+## ✅ 3. No idle / connection timeout on command TCP connections
 
 **File:** `server/src/main.rs` — `handle_command_connection`
 
@@ -46,7 +46,7 @@ A long-lived idle TCP connection holds the command socket session open indefinit
 
 ---
 
-## 4. JWT algorithm not explicitly locked down
+## ✅ 4. JWT algorithm not explicitly locked down
 
 **File:** `server/src/ws.rs` — `validate_jwt_claims`
 
@@ -54,13 +54,13 @@ The `jsonwebtoken` decode call uses `Algorithm::HS256` explicitly, which is corr
 
 ---
 
-## 5. No audit log for security events
+## ✅ 5. No audit log for security events
 
 There is no structured log of: failed auth attempts (with IP and reason), command API key rejections, or rate limit hits. Metrics counters capture aggregates but there is no event trail. Add `tracing::warn!` calls at auth failure and rate limit hit points so that a log aggregator can detect brute-force patterns in real time.
 
 ---
 
-## 6. `ws_allowed_origins` is empty by default — no CSRF protection in browser deployments
+## ✅ 6. `ws_allowed_origins` is empty by default — no CSRF protection in browser deployments
 
 **File:** `server/src/ws.rs`
 
@@ -68,7 +68,7 @@ When `ws_allowed_origins` is empty, the server accepts WebSocket connections fro
 
 ---
 
-## 7. Health endpoint exposes internal metrics without authentication
+## ✅ 7. Health endpoint exposes internal metrics without authentication
 
 **File:** `server/src/main.rs` — `handle_health_connection`
 

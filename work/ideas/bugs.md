@@ -4,7 +4,7 @@ Concrete bugs identified in the current codebase.
 
 ---
 
-## 1. `constant_time_eq` compares wrong iterators
+## ✅ 1. `constant_time_eq` compares wrong iterators
 
 **File:** `server/src/main.rs`
 
@@ -22,7 +22,7 @@ The simplest fix is to use the `subtle` crate's `ConstantTimeEq` implementation 
 
 ---
 
-## 2. Build script uses wrong directory name
+## ✅ 2. Build script uses wrong directory name
 
 **File:** `scripts/build_push.sh`
 
@@ -38,7 +38,7 @@ cd "$REPO_ROOT/server"
 
 ---
 
-## 3. Publish script uses wrong directory name
+## ✅ 3. Publish script uses wrong directory name
 
 **File:** `scripts/publish_ts_client.sh`
 
@@ -54,7 +54,7 @@ CLIENT_DIR="$REPO_ROOT/client"
 
 ---
 
-## 4. Doc/code mismatch: `auth_failed` vs `auth_error`
+## ✅ 4. Doc/code mismatch: `auth_failed` vs `auth_error`
 
 **File:** `server/doc/client-protocol.md`
 
@@ -64,7 +64,7 @@ Fix: update `client-protocol.md` to use `auth_error` consistently, and search fo
 
 ---
 
-## 5. Example config JWT key is too short
+## ✅ 5. Example config JWT key is too short
 
 **File:** `server/example/config.yaml`
 

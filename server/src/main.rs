@@ -19,12 +19,14 @@ use anyhow::{Context, Result};
 use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock},
+    time::timeout,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Deserialize)]
 struct SyncpondConfig {
@@ -321,21 +323,7 @@ const DEFAULT_COMMAND_AUTH_RATE_LIMIT: usize = 5;
 const DEFAULT_COMMAND_AUTH_RATE_WINDOW_SECS: u64 = 60;
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        // Run the loop anyway to avoid leaking length via timing.
-        let mut diff = 1u8;
-        for (x, y) in a.iter().zip(a.iter()) {
-            diff |= x ^ y;
-        }
-        return diff != 0; // always true, timing-similar to equal-length case
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 async fn read_line_with_limit<R>(reader: &mut BufReader<R>, line: &mut String) -> Result<usize>
@@ -572,7 +560,7 @@ async fn handle_command_connection(
         )
         .await;
     if !allowed {
-        info!(%peer, "command rate limit exceeded");
+        warn!(%peer, "command rate limit exceeded");
         return Ok(());
     }
 
@@ -584,7 +572,7 @@ async fn handle_command_connection(
         )
         .await;
     if !auth_allowed {
-        info!(%peer, "command auth rate limit exceeded");
+        warn!(%peer, "command auth rate limit exceeded");
         return Ok(());
     }
 
@@ -595,9 +583,22 @@ async fn handle_command_connection(
     let mut writer = BufWriter::new(writer);
     let mut line = String::new();
 
-    // first message must be API key
+    // first message must be API key; enforce 30 s idle timeout so a
+    // connection that never sends cannot hold a fd open forever.
     line.clear();
-    let first_bytes = read_line_with_limit(&mut reader, &mut line).await?;
+    let first_bytes = match timeout(
+        Duration::from_secs(30),
+        read_line_with_limit(&mut reader, &mut line),
+    )
+    .await
+    {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            warn!(%peer, "command connection idle timeout before auth");
+            return Ok(());
+        }
+    };
     if first_bytes == 0 {
         return Ok(());
     }
@@ -614,6 +615,7 @@ async fn handle_command_connection(
                 let mut app = state.write().await;
                 app.command_auth_failure = app.command_auth_failure.saturating_add(1);
             }
+            warn!(%peer, "command API key rejected: invalid_api_key");
             writer.write_all(b"ERROR invalid_api_key\n").await?;
             writer.flush().await?;
             return Ok(());
@@ -623,6 +625,7 @@ async fn handle_command_connection(
             let mut app = state.write().await;
             app.command_auth_failure = app.command_auth_failure.saturating_add(1);
         }
+        warn!(%peer, "command API key rejected: api_key_not_configured");
         writer.write_all(b"ERROR api_key_not_configured\n").await?;
         writer.flush().await?;
         return Ok(());

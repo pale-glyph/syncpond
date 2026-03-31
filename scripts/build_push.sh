@@ -49,7 +49,7 @@ fi
 FULL_IMAGE="${IMAGE_NAME}:${TAG}"
 
 echo "[*] Building syncpond server Docker image: $FULL_IMAGE"
-cd "$REPO_ROOT/syncpond-server"
+cd "$REPO_ROOT/server"
 
 docker build --pull -t "$FULL_IMAGE" -f Dockerfile .
 

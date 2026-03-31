@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_ROOT="${SCRIPT_DIR%/*}"
-CLIENT_DIR="$REPO_ROOT/syncpond-client"
+CLIENT_DIR="$REPO_ROOT/client"
 
 REGISTRY="https://npm.lab-2.paleglyph.com/"
 TAG="latest"

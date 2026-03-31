@@ -2,8 +2,16 @@
 # Update command_api_key with your real secret before production.
 command_api_key: "fake-api-key-123456"
 ws_addr: "0.0.0.0:8080"
-command_addr: "0.0.0.0:9090"
-jwt_key: FAKEKEY
+# command_addr is an administrative interface — keep it on loopback or a private network.
+command_addr: "127.0.0.1:9090"
+jwt_key: "REPLACE_ME_WITH_A_SECRET_OF_AT_LEAST_32_BYTES_LONG"  # must be >= 32 bytes
 jwt_issuer: syncpond-server
 jwt_audience: syncpond
 jwt_ttl_seconds: 3600
+# Restrict /metrics to loopback to avoid capacity reconnaissance.
+health_bind_loopback_only: true
+# For browser deployments, set ws_allowed_origins to a list of allowed origins
+# (e.g. ["https://app.example.com"]) to prevent cross-origin WebSocket connections
+# from malicious pages. Leaving this empty accepts any origin.
+# ws_allowed_origins:
+#   - "https://app.example.com"

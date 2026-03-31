@@ -24,7 +24,7 @@ This document describes the syncpond client protocol used by WebSocket clients a
      ```
    - On failure:
      ```json
-     {"type":"auth_failed","message":"..."}
+     {"type":"auth_error","reason":"..."}
      ```
 
 4. Update stream:
@@ -51,19 +51,7 @@ This document describes the syncpond client protocol used by WebSocket clients a
   }
   ```
 
-- `auth_failed` (response to auth failure)
-  - `type`: `"auth_failed"`
-  - `message`: error string
-
-  Example:
-  ```json
-  {
-    "type": "auth_failed",
-    "message": "invalid_jwt"
-  }
-  ```
-
-- `auth_error` (during auth or unexpected message after auth)
+- `auth_error` (response to auth failure or unexpected message after auth)
   - `type`: `"auth_error"`
   - `reason`: error string
 
