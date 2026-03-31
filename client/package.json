@@ -1,0 +1,21 @@
+{
+  "name": "@paleglyph/syncpond-client",
+  "version": "0.1.0",
+  "description": "TypeScript shared client for Syncpond realtime sync server",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rm -rf dist",
+    "lint": "echo \"No lint configured\"",
+    "test": "echo \"No tests configured\""
+  },
+  "keywords": ["syncpond", "ws", "realtime", "client"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^20.11.0"
+  }
+}
