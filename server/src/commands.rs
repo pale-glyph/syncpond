@@ -13,6 +13,7 @@ pub struct RoomUpdate {
 
 const MAX_COMMAND_CONTAINER_LEN: usize = 256;
 const MAX_COMMAND_KEY_LEN: usize = 256;
+const MAX_LABEL_LEN: usize = 256;
 
 fn validate_container_name(name: &str) -> Result<(), String> {
     if name.len() > MAX_COMMAND_CONTAINER_LEN {
@@ -24,6 +25,16 @@ fn validate_container_name(name: &str) -> Result<(), String> {
 fn validate_key_name(key: &str) -> Result<(), String> {
     if key.len() > MAX_COMMAND_KEY_LEN {
         return Err("ERROR key_too_long".into());
+    }
+    Ok(())
+}
+
+fn validate_label_name(label: &str) -> Result<(), String> {
+    if label.trim().is_empty() {
+        return Err("ERROR label_invalid".into());
+    }
+    if label.len() > MAX_LABEL_LEN {
+        return Err("ERROR label_invalid".into());
     }
     Ok(())
 }
@@ -81,6 +92,41 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
             let app = state.read().await;
             match app.room_info(room_id) {
                 Ok(info) => (format!("OK {}", info), vec![]),
+                Err(e) => (error_of(e), vec![]),
+            }
+        }
+        "ROOM.LABEL" => {
+            let (room_id, rest) = match parse_room_id_from_remainder(remainder) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            let (label, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if let Err(e) = validate_label_name(&label) {
+                return (e, vec![]);
+            }
+            if !rest.trim().is_empty() {
+                return ("ERROR extra_arguments".into(), vec![]);
+            }
+            let mut app = state.write().await;
+            match app.set_room_label(room_id, label.clone()) {
+                Ok(()) => ("OK".into(), vec![]),
+                Err(e) => (error_of(e), vec![]),
+            }
+        }
+        "ROOM.FIND" => {
+            let (label, rest) = match take_token(remainder) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if !rest.trim().is_empty() {
+                return ("ERROR extra_arguments".into(), vec![]);
+            }
+            let app = state.read().await;
+            match app.get_room_id_by_label(&label) {
+                Ok(id) => (format!("OK {}", id), vec![]),
                 Err(e) => (error_of(e), vec![]),
             }
         }
@@ -773,5 +819,41 @@ mod tests {
 
         let (resp, _) = process_command("ROOM.DELETE 1 extra", &state).await;
         assert_eq!(resp, "ERROR extra_arguments");
+    }
+
+    #[tokio::test]
+    async fn test_room_label_and_find() {
+        let state = sample_state();
+        process_command("ROOM.CREATE", &state).await;
+
+        let (resp, _) = process_command("ROOM.LABEL 1 mylabel", &state).await;
+        assert_eq!(resp, "OK");
+
+        let (resp, _) = process_command("ROOM.FIND mylabel", &state).await;
+        assert_eq!(resp, "OK 1");
+
+        // quoted label with spaces
+        let (resp, _) = process_command("ROOM.LABEL 1 \"My Room\"", &state).await;
+        assert_eq!(resp, "OK");
+        let (resp, _) = process_command("ROOM.FIND \"My Room\"", &state).await;
+        assert_eq!(resp, "OK 1");
+    }
+
+    #[tokio::test]
+    async fn test_room_label_in_use_and_missing() {
+        let state = sample_state();
+        process_command("ROOM.CREATE", &state).await;
+        process_command("ROOM.CREATE", &state).await; // room 2
+
+        let (resp, _) = process_command("ROOM.LABEL 1 shared", &state).await;
+        assert_eq!(resp, "OK");
+
+        // Attempt to label room 2 with same label -> error
+        let (resp, _) = process_command("ROOM.LABEL 2 shared", &state).await;
+        assert_eq!(resp, "ERROR label_in_use");
+
+        // Finding a non-existent label
+        let (resp, _) = process_command("ROOM.FIND no_such_label", &state).await;
+        assert_eq!(resp, "ERROR label_not_found");
     }
 }

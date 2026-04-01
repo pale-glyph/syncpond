@@ -68,6 +68,12 @@ pub enum StateError {
 
     /// Command API key is blank/invalid.
     CommandApiKeyInvalid,
+    /// Label not found when looking up by name.
+    LabelNotFound,
+    /// Label already in use by another room.
+    LabelInUse,
+    /// Label value is invalid (empty or too long).
+    LabelInvalid,
 }
 
 impl std::fmt::Display for StateError {
@@ -85,6 +91,9 @@ impl std::fmt::Display for StateError {
             }
             StateError::JwtKeyTooShort => write!(f, "jwt_key_too_short"),
             StateError::CommandApiKeyInvalid => write!(f, "command_api_key_invalid"),
+            StateError::LabelNotFound => write!(f, "label_not_found"),
+            StateError::LabelInUse => write!(f, "label_in_use"),
+            StateError::LabelInvalid => write!(f, "label_invalid"),
         }
     }
 }
@@ -120,6 +129,8 @@ pub struct AppState {
     pub ws_send_errors: u64,
     /// in-memory rooms map.
     pub rooms: HashMap<u64, Arc<StdRwLock<RoomState>>>,
+    /// Mapping from human-friendly label -> room id.
+    pub labels: HashMap<String, u64>,
     pub next_room_id: u64,
     pub jwt_key: Option<String>,
     pub jwt_ttl_seconds: u64,
@@ -135,6 +146,7 @@ impl AppState {
         Self {
             total_ws_connections: 0,
             rooms: HashMap::new(),
+            labels: HashMap::new(),
             next_room_id: 1,
             jwt_key: None,
             jwt_ttl_seconds: 3600,
@@ -174,10 +186,44 @@ impl AppState {
     /// Delete a room by ID.
     pub fn delete_room(&mut self, room_id: u64) -> Result<(), StateError> {
         if self.rooms.remove(&room_id).is_some() {
+            // Remove any labels that pointed to this room.
+            self.labels.retain(|_k, &mut v| v != room_id);
             Ok(())
         } else {
             Err(StateError::RoomNotFound)
         }
+    }
+
+    /// Associate a human-friendly label with a room id.
+    /// Returns an error if the room does not exist or the label is already used.
+    pub fn set_room_label(&mut self, room_id: u64, label: String) -> Result<(), StateError> {
+        let label_trimmed = label.trim();
+        if label_trimmed.is_empty() || label_trimmed.len() > 256 {
+            return Err(StateError::LabelInvalid);
+        }
+
+        if !self.rooms.contains_key(&room_id) {
+            return Err(StateError::RoomNotFound);
+        }
+
+        if let Some(&existing) = self.labels.get(label_trimmed) {
+            if existing != room_id {
+                return Err(StateError::LabelInUse);
+            }
+            return Ok(());
+        }
+
+        self.labels.insert(label_trimmed.to_string(), room_id);
+        Ok(())
+    }
+
+    /// Look up a room id by its label.
+    pub fn get_room_id_by_label(&self, label: &str) -> Result<u64, StateError> {
+        let label_trimmed = label.trim();
+        self.labels
+            .get(label_trimmed)
+            .copied()
+            .ok_or(StateError::LabelNotFound)
     }
 
     /// Set a fragment value in a container within a room.
@@ -927,6 +973,9 @@ mod tests {
             (StateError::JwtIssuerAudienceNotConfigured, "jwt_issuer_audience_not_configured"),
             (StateError::JwtKeyTooShort, "jwt_key_too_short"),
             (StateError::CommandApiKeyInvalid, "command_api_key_invalid"),
+            (StateError::LabelNotFound, "label_not_found"),
+            (StateError::LabelInUse, "label_in_use"),
+            (StateError::LabelInvalid, "label_invalid"),
         ];
         for (err, expected) in cases {
             assert_eq!(err.to_string(), expected);
