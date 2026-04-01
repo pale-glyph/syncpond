@@ -3,6 +3,7 @@ name = "syncpond-protocol"
 version = "0.1.0"
 edition = "2021"
 description = "Syncpond app protocol types and parsing utilities"
+license = "MIT"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
