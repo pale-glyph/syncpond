@@ -340,30 +340,42 @@ pub async fn handle_ws_connection(
     debug!(%peer, auth_type = %auth_msg.typ, last_seen = ?auth_msg.last_seen_counter, "parsed auth message");
 
     if auth_msg.typ != "auth" {
+        debug!(%peer, "acquiring state.write for missing_auth");
         {
             let mut app = state.write().await;
             app.ws_auth_failure += 1;
         }
+        debug!(%peer, "released state.write after missing_auth increment");
         warn!(%peer, reason = "missing_auth", "ws auth failure");
         let err = json!({"type":"auth_error","reason":"missing_auth"});
         ws_sender.send(Message::Text(err.to_string())).await.ok();
         return Ok(());
     }
 
-    let app = state.read().await;
-    let claims = match validate_jwt_claims(&app, &auth_msg.jwt) {
+    debug!(%peer, "attempting state.read to validate jwt claims");
+    let claims_res = {
+        let app_read = state.read().await;
+        debug!(%peer, "acquired state.read for jwt claims");
+        validate_jwt_claims(&app_read, &auth_msg.jwt)
+    };
+    debug!(%peer, "released state.read after jwt claims validation");
+    let claims = match claims_res {
         Ok(claims) => {
             // auth success counter
+            debug!(%peer, "acquiring state.write to increment ws_auth_success");
             let mut app = state.write().await;
             app.ws_auth_success += 1;
+            debug!(%peer, "released state.write after ws_auth_success increment");
             info!(%peer, room = %claims.room, "ws auth success");
             claims
         }
         Err(reason) => {
+            debug!(%peer, "acquiring state.write to increment ws_auth_failure (invalid_jwt)");
             {
                 let mut app = state.write().await;
                 app.ws_auth_failure += 1;
             }
+            debug!(%peer, "released state.write after ws_auth_failure increment");
             warn!(%peer, %reason, "ws auth failure: invalid_jwt");
             let err = json!({"type":"auth_error","reason":"invalid_jwt","detail": reason});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
@@ -385,8 +397,10 @@ pub async fn handle_ws_connection(
         claims.containers.unwrap_or_default().into_iter().collect();
     allowed_containers.insert("public".to_string());
 
+    debug!(%peer, room_id = room_id, "acquiring state.read for room snapshot");
     let room_state_snapshot = {
         let app = state.read().await;
+        debug!(%peer, room_id = room_id, "acquired state.read for room snapshot");
         app.room_snapshot(room_id, &allowed_containers)
     };
     let room_state_snapshot = match room_state_snapshot {
@@ -404,8 +418,10 @@ pub async fn handle_ws_connection(
         .unwrap_or(0);
     debug!(%peer, room_id = room_id, container_count, "prepared room snapshot");
 
+    debug!(%peer, room_id = room_id, "acquiring state.read for room version");
     let room_counter = {
         let app = state.read().await;
+        debug!(%peer, room_id = room_id, "acquired state.read for room version");
         app.room_version(room_id).unwrap_or(0)
     };
 
