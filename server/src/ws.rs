@@ -134,10 +134,14 @@ impl WsHub {
                 .await
             {
                 error!(room_id = update.room_id, client = ?client_id, "ws client update rate limited, dropping client");
-                {
-                    let mut app = state.write().await;
+                // Avoid awaiting on `state.write()` while holding the hub lock — spawn a small
+                // background task to increment the counter so we don't risk lock-order inversion
+                // between `ws_hub` and `state`.
+                let state_clone = (*state).clone();
+                tokio::spawn(async move {
+                    let mut app = state_clone.write().await;
                     app.ws_update_rate_limited = app.ws_update_rate_limited.saturating_add(1);
-                }
+                });
                 disconnected.push(*client_id);
                 continue;
             }
@@ -146,10 +150,11 @@ impl WsHub {
                 match err {
                     mpsc::error::TrySendError::Full(_) => {
                         error!(room_id = update.room_id, client = ?client_id, "ws client queue full, dropping client");
-                        {
-                            let mut app = state.write().await;
+                        let state_clone = (*state).clone();
+                        tokio::spawn(async move {
+                            let mut app = state_clone.write().await;
                             app.ws_update_dropped = app.ws_update_dropped.saturating_add(1);
-                        }
+                        });
                         disconnected.push(*client_id);
                     }
                     mpsc::error::TrySendError::Closed(_) => {
