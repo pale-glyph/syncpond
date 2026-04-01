@@ -18,7 +18,7 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, debug};
 use uuid::Uuid;
 
 const MAX_WS_CLIENTS_PER_ROOM: usize = 200;
@@ -134,9 +134,6 @@ impl WsHub {
                 .await
             {
                 error!(room_id = update.room_id, client = ?client_id, "ws client update rate limited, dropping client");
-                // Avoid awaiting on `state.write()` while holding the hub lock — spawn a small
-                // background task to increment the counter so we don't risk lock-order inversion
-                // between `ws_hub` and `state`.
                 let state_clone = (*state).clone();
                 tokio::spawn(async move {
                     let mut app = state_clone.write().await;
@@ -303,14 +300,21 @@ pub async fn handle_ws_connection(
         tokio_tungstenite::accept_async(stream).await?
     };
     info!(%peer, "websocket connection established");
+    debug!(%peer, allowed_origins = ws_allowed_origins.len(), "ws accept details");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     let auth_text = match ws_receiver.next().await {
-        Some(Ok(Message::Text(txt))) => txt,
+        Some(Ok(Message::Text(txt))) => {
+            let auth_len = txt.len();
+            debug!(%peer, auth_len, "received auth text");
+            txt
+        }
         Some(Ok(_)) => {
-            let mut app = state.write().await;
-            app.ws_auth_failure += 1;
+            {
+                let mut app = state.write().await;
+                app.ws_auth_failure += 1;
+            }
             warn!(%peer, reason = "invalid_auth_message", "ws auth failure");
             let err = json!({"type":"auth_error","reason":"invalid_auth_message"});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
@@ -323,18 +327,23 @@ pub async fn handle_ws_connection(
     let auth_msg: AuthMessage = match serde_json::from_str(&auth_text) {
         Ok(v) => v,
         Err(_) => {
-            let mut app = state.write().await;
-            app.ws_auth_failure += 1;
+            {
+                let mut app = state.write().await;
+                app.ws_auth_failure += 1;
+            }
             warn!(%peer, reason = "invalid_json", "ws auth failure");
             let err = json!({"type":"auth_error","reason":"invalid_json"});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
             return Ok(());
         }
     };
+    debug!(%peer, auth_type = %auth_msg.typ, last_seen = ?auth_msg.last_seen_counter, "parsed auth message");
 
     if auth_msg.typ != "auth" {
-        let mut app = state.write().await;
-        app.ws_auth_failure += 1;
+        {
+            let mut app = state.write().await;
+            app.ws_auth_failure += 1;
+        }
         warn!(%peer, reason = "missing_auth", "ws auth failure");
         let err = json!({"type":"auth_error","reason":"missing_auth"});
         ws_sender.send(Message::Text(err.to_string())).await.ok();
@@ -347,11 +356,14 @@ pub async fn handle_ws_connection(
             // auth success counter
             let mut app = state.write().await;
             app.ws_auth_success += 1;
+            info!(%peer, room = %claims.room, "ws auth success");
             claims
         }
         Err(reason) => {
-            let mut app = state.write().await;
-            app.ws_auth_failure += 1;
+            {
+                let mut app = state.write().await;
+                app.ws_auth_failure += 1;
+            }
             warn!(%peer, %reason, "ws auth failure: invalid_jwt");
             let err = json!({"type":"auth_error","reason":"invalid_jwt","detail": reason});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
@@ -375,15 +387,22 @@ pub async fn handle_ws_connection(
 
     let room_state_snapshot = {
         let app = state.read().await;
-        match app.room_snapshot(room_id, &allowed_containers) {
-            Some(s) => s,
-            None => {
-                let err = json!({"type":"auth_error","reason":"room_not_found"});
-                ws_sender.send(Message::Text(err.to_string())).await.ok();
-                return Ok(());
-            }
+        app.room_snapshot(room_id, &allowed_containers)
+    };
+    let room_state_snapshot = match room_state_snapshot {
+        Some(s) => s,
+        None => {
+            let err = json!({"type":"auth_error","reason":"room_not_found"});
+            ws_sender.send(Message::Text(err.to_string())).await.ok();
+            return Ok(());
         }
     };
+    let container_count = room_state_snapshot
+        .get("containers")
+        .and_then(|c| c.as_object())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    debug!(%peer, room_id = room_id, container_count, "prepared room snapshot");
 
     let room_counter = {
         let app = state.read().await;
@@ -396,26 +415,29 @@ pub async fn handle_ws_connection(
         "state": room_state_snapshot,
     });
 
+    debug!(%peer, room_id = room_id, "sending auth_ok");
     ws_sender.send(Message::Text(auth_ok.to_string())).await?;
 
     let (tx, mut rx) = mpsc::channel::<Value>(MAX_WS_PENDING_MESSAGES);
     let client_id = Uuid::new_v4();
 
-    {
+    let add_res = {
         let mut hub = ws_hub.lock().await;
-        if let Err(reason) = hub.add_client(
+        hub.add_client(
             room_id,
             client_id,
             ClientInfo {
                 allowed_containers: allowed_containers.clone(),
                 sender: tx,
             },
-        ) {
-            let err = json!({"type":"auth_error","reason":reason});
-            ws_sender.send(Message::Text(err.to_string())).await.ok();
-            return Ok(());
-        }
+        )
+    };
+    if let Err(reason) = add_res {
+        let err = json!({"type":"auth_error","reason":reason});
+        ws_sender.send(Message::Text(err.to_string())).await.ok();
+        return Ok(());
     }
+    info!(%peer, room_id = room_id, client_id = %client_id, allowed_containers = allowed_containers.len(), "ws client added");
 
     {
         let mut app = state.write().await;
@@ -431,15 +453,25 @@ pub async fn handle_ws_connection(
             msg = ws_receiver.next() => {
                 match msg {
                     Some(Ok(Message::Ping(payload))) => {
+                        debug!(%peer, ping_len = payload.len(), "received ping");
                         ws_sender.send(Message::Pong(payload)).await.ok();
                     }
-                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Pong(_))) => {
+                        debug!(%peer, "received pong");
+                    }
                     Some(Ok(Message::Close(frame))) => {
                         info!(%peer, ?frame, "ws close by client");
                         ws_sender.close().await.ok();
                         break;
                     }
-                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
+                    Some(Ok(Message::Text(txt))) => {
+                        warn!(%peer, msg_len = txt.len(), "unexpected text message after auth");
+                        let err = json!({"type":"auth_error","reason":"unexpected_message_after_auth"});
+                        ws_sender.send(Message::Text(err.to_string())).await.ok();
+                        break;
+                    }
+                    Some(Ok(Message::Binary(bin))) => {
+                        warn!(%peer, bin_len = bin.len(), "unexpected binary message after auth");
                         let err = json!({"type":"auth_error","reason":"unexpected_message_after_auth"});
                         ws_sender.send(Message::Text(err.to_string())).await.ok();
                         break;
@@ -455,6 +487,7 @@ pub async fn handle_ws_connection(
             event = rx.recv() => {
                 match event {
                     Some(event) => {
+                        debug!(%peer, "forwarding event to ws client");
                         if let Err(err) = ws_sender.send(Message::Text(event.to_string())).await {
                             error!(%err, "ws outgoing error");
                             {
