@@ -55,7 +55,13 @@ struct SyncpondConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    // Configure logging from environment. Prefer `SYNCPOND_LOG`, fall back to `RUST_LOG`,
+    // defaulting to `info` when neither is set.
+    let log_env = std::env::var("SYNCPOND_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info".to_string());
+    tracing_subscriber::fmt().with_env_filter(log_env.clone()).init();
+    info!(%log_env, "logging initialized");
 
     let config_path =
         std::env::var("SYNCPOND_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
