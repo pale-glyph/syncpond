@@ -149,8 +149,7 @@ pub struct AppState {
     pub last_jwt_issue_seconds: Option<u64>,
     pub command_api_key: Option<String>,
     /// Optional directory path where SAVE/LOAD JSON files will be stored/read.
-    /// If `None`, files are written/read in the current working directory as "<roomid>.json".
-    pub save_dir: Option<PathBuf>,
+    pub save_dir: PathBuf,
 }
 
 impl AppState {
@@ -178,7 +177,7 @@ impl AppState {
             ws_update_dropped: 0,
             ws_update_rate_limited: 0,
             ws_send_errors: 0,
-                save_dir: None,
+            save_dir: None,
         }
     }
 
