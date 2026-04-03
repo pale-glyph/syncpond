@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
     }
 
     let shared_state = Arc::new(RwLock::new(base_state));
+
     let ws_hub = Arc::new(Mutex::new(WsHub::new()));
     let ws_auth_rate_limiter = Arc::new(RateLimiter::new());
     let ws_update_rate_limiter = Arc::new(RateLimiter::new());
