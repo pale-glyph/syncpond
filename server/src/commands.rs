@@ -510,7 +510,7 @@ struct SavedRoom {
     containers: HashMap<String, HashMap<String, SavedFragment>>,
 }
 
-/// `SAVE <room_id> <path>` — atomically snapshot a room to a JSON file.
+/// `SAVE <room_id>` — atomically snapshot a room to a JSON file named "<roomid>.json".
 ///
 /// Returns when the file has been flushed or on the first error.
 /// All other operations against the room return `ERROR room_io_busy` while
@@ -520,13 +520,10 @@ async fn cmd_save(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
         Ok(x) => x,
         Err(e) => return (e, vec![]),
     };
-    let (path, rest) = match take_token(rest) {
-        Ok(x) => x,
-        Err(e) => return (e, vec![]),
-    };
     if !rest.trim().is_empty() {
         return ("ERROR extra_arguments".into(), vec![]);
     }
+    let path = format!("{}.json", room_id);
 
     // 1. Get the room Arc and set io_locked.
     let room_arc = {
@@ -615,7 +612,7 @@ async fn cmd_save(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
     ("OK".into(), vec![])
 }
 
-/// `LOAD <room_id> <path>` — replace a room's in-memory state from a JSON file.
+/// `LOAD <room_id>` — replace a room's in-memory state from a JSON file named "<roomid>.json".
 ///
 /// Returns when the load has completed. The command socket stays open until
 /// the operation finishes or errors. WS clients receive a wildcard update so
@@ -628,13 +625,10 @@ async fn cmd_load(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
         Ok(x) => x,
         Err(e) => return (e, vec![]),
     };
-    let (path, rest) = match take_token(rest) {
-        Ok(x) => x,
-        Err(e) => return (e, vec![]),
-    };
     if !rest.trim().is_empty() {
         return ("ERROR extra_arguments".into(), vec![]);
     }
+    let path = format!("{}.json", room_id);
 
     // 1. Get the room Arc and set io_locked.
     let room_arc = {

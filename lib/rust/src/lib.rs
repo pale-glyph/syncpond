@@ -43,6 +43,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_and_format_persist_commands() {
+        let s = "PERSIST.SET 1 public foo";
+        let cmd = parse_command(s).unwrap();
+        assert_eq!(cmd, Command::PersistSet { room_id: 1, container: "public".into(), key: "foo".into() });
+        assert_eq!(format_command(&cmd), "PERSIST.SET 1 public foo");
+
+        let s2 = "PERSIST.UNSET 1 public foo";
+        let cmd2 = parse_command(s2).unwrap();
+        assert_eq!(cmd2, Command::PersistUnset { room_id: 1, container: "public".into(), key: "foo".into() });
+        assert_eq!(format_command(&cmd2), "PERSIST.UNSET 1 public foo");
+
+        let s3 = "PERSIST.GET 1 public foo";
+        let cmd3 = parse_command(s3).unwrap();
+        assert_eq!(cmd3, Command::PersistGet { room_id: 1, container: "public".into(), key: "foo".into() });
+        assert_eq!(format_command(&cmd3), "PERSIST.GET 1 public foo");
+    }
+
+    #[test]
+    fn parse_and_format_save_load_commands() {
+        let s = "SAVE 1";
+        let cmd = parse_command(s).unwrap();
+        assert_eq!(cmd, Command::Save { room_id: 1 });
+        assert_eq!(format_command(&cmd), "SAVE 1");
+
+        let s2 = "LOAD 1";
+        let cmd2 = parse_command(s2).unwrap();
+        assert_eq!(cmd2, Command::Load { room_id: 1 });
+        assert_eq!(format_command(&cmd2), "LOAD 1");
+    }
+
+    #[test]
     fn response_roundtrip() {
         let r = Response::Ok(Some("{\"a\":1}".to_string()));
         let s = format_response(&r);

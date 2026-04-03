@@ -23,6 +23,11 @@ pub enum Command {
     TxEnd(u64),
     TxAbort(u64),
     TokenGen { room_id: u64, containers: Vec<String> },
+    Save { room_id: u64 },
+    Load { room_id: u64 },
+    PersistSet { room_id: u64, container: String, key: String },
+    PersistUnset { room_id: u64, container: String, key: String },
+    PersistGet { room_id: u64, container: String, key: String },
 }
 
 /// Simple response representation. `Ok` may contain an optional payload string.
@@ -170,6 +175,47 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
             }
             Ok(Command::TokenGen { room_id, containers })
         }
+        "SAVE" => {
+            let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
+            if !rest.trim().is_empty() {
+                return Err("ERROR extra_arguments".into());
+            }
+            Ok(Command::Save { room_id })
+        }
+        "LOAD" => {
+            let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
+            if !rest.trim().is_empty() {
+                return Err("ERROR extra_arguments".into());
+            }
+            Ok(Command::Load { room_id })
+        }
+        "PERSIST.SET" => {
+            let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
+            let (container, rest) = take_token(rest)?;
+            let (key, rest) = take_token(rest)?;
+            if !rest.trim().is_empty() {
+                return Err("ERROR extra_arguments".into());
+            }
+            Ok(Command::PersistSet { room_id, container, key })
+        }
+        "PERSIST.UNSET" => {
+            let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
+            let (container, rest) = take_token(rest)?;
+            let (key, rest) = take_token(rest)?;
+            if !rest.trim().is_empty() {
+                return Err("ERROR extra_arguments".into());
+            }
+            Ok(Command::PersistUnset { room_id, container, key })
+        }
+        "PERSIST.GET" => {
+            let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
+            let (container, rest) = take_token(rest)?;
+            let (key, rest) = take_token(rest)?;
+            if !rest.trim().is_empty() {
+                return Err("ERROR extra_arguments".into());
+            }
+            Ok(Command::PersistGet { room_id, container, key })
+        }
         _ => Err("ERROR unknown_command".into()),
     }
 }
@@ -202,6 +248,21 @@ pub fn format_command(cmd: &Command) -> String {
             let mut parts = vec![room_id.to_string()];
             parts.extend(containers.iter().map(|c| format_token(c)));
             format!("TOKEN.GEN {}", parts.join(" "))
+        }
+        Command::Save { room_id } => {
+            format!("SAVE {}", room_id)
+        }
+        Command::Load { room_id } => {
+            format!("LOAD {}", room_id)
+        }
+        Command::PersistSet { room_id, container, key } => {
+            format!("PERSIST.SET {} {} {}", room_id, format_token(container), format_token(key))
+        }
+        Command::PersistUnset { room_id, container, key } => {
+            format!("PERSIST.UNSET {} {} {}", room_id, format_token(container), format_token(key))
+        }
+        Command::PersistGet { room_id, container, key } => {
+            format!("PERSIST.GET {} {} {}", room_id, format_token(container), format_token(key))
         }
     }
 }
