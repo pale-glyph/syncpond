@@ -523,15 +523,20 @@ async fn cmd_save(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
     if !rest.trim().is_empty() {
         return ("ERROR extra_arguments".into(), vec![]);
     }
-    let path = format!("{}.json", room_id);
-
-    // 1. Get the room Arc and set io_locked.
-    let room_arc = {
+    // Determine file path (inside configured save_dir if present).
+    // 1. Get the room Arc and configured path, then set io_locked.
+    let (room_arc, pathbuf) = {
         let app = state.read().await;
-        match app.rooms.get(&room_id) {
+        let arc = match app.rooms.get(&room_id) {
             Some(arc) => arc.clone(),
             None => return (error_of(StateError::RoomNotFound), vec![]),
-        }
+        };
+        let pb = if let Some(dir) = &app.save_dir {
+            dir.join(format!("{}.json", room_id))
+        } else {
+            std::path::PathBuf::from(format!("{}.json", room_id))
+        };
+        (arc, pb)
     };
     {
         let mut room = match room_arc.write() {
@@ -587,10 +592,22 @@ async fn cmd_save(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
         }
     };
 
-    // 3. Write to disk.
-    if let Err(e) = tokio::fs::write(&path, json_bytes.as_bytes()).await {
+    // 3. Ensure parent directory exists (if configured) and write to disk.
+    if let Some(parent) = pathbuf.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                room_arc.write().ok().map(|mut r| r.io_locked = false);
+                let path_display = pathbuf.to_string_lossy();
+                warn!(room_id, path = %path_display, %e, "SAVE mkdir failed");
+                return (format!("ERROR io_failed {}", e), vec![]);
+            }
+        }
+    }
+
+    if let Err(e) = tokio::fs::write(&pathbuf, json_bytes.as_bytes()).await {
         room_arc.write().ok().map(|mut r| r.io_locked = false);
-        warn!(room_id, path = %path, %e, "SAVE file write failed");
+        let path_display = pathbuf.to_string_lossy();
+        warn!(room_id, path = %path_display, %e, "SAVE file write failed");
         return (format!("ERROR io_failed {}", e), vec![]);
     }
 
@@ -608,7 +625,8 @@ async fn cmd_save(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
         room.io_locked = false;
     }
 
-    info!(room_id, path = %path, "SAVE complete");
+    let path_display = pathbuf.to_string_lossy();
+    info!(room_id, path = %path_display, "SAVE complete");
     ("OK".into(), vec![])
 }
 
@@ -628,15 +646,20 @@ async fn cmd_load(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
     if !rest.trim().is_empty() {
         return ("ERROR extra_arguments".into(), vec![]);
     }
-    let path = format!("{}.json", room_id);
-
-    // 1. Get the room Arc and set io_locked.
-    let room_arc = {
+    // Determine file path (inside configured save_dir if present).
+    // 1. Get the room Arc and configured path, then set io_locked.
+    let (room_arc, pathbuf) = {
         let app = state.read().await;
-        match app.rooms.get(&room_id) {
+        let arc = match app.rooms.get(&room_id) {
             Some(arc) => arc.clone(),
             None => return (error_of(StateError::RoomNotFound), vec![]),
-        }
+        };
+        let pb = if let Some(dir) = &app.save_dir {
+            dir.join(format!("{}.json", room_id))
+        } else {
+            std::path::PathBuf::from(format!("{}.json", room_id))
+        };
+        (arc, pb)
     };
     {
         let mut room = match room_arc.write() {
@@ -650,11 +673,12 @@ async fn cmd_load(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
     }
 
     // 2. Read file from disk (no room lock held).
-    let file_bytes = match tokio::fs::read(&path).await {
+    let file_bytes = match tokio::fs::read(&pathbuf).await {
         Ok(b) => b,
         Err(e) => {
             room_arc.write().ok().map(|mut r| r.io_locked = false);
-            warn!(room_id, path = %path, %e, "LOAD file read failed");
+            let path_display = pathbuf.to_string_lossy();
+            warn!(room_id, path = %path_display, %e, "LOAD file read failed");
             return (format!("ERROR io_failed {}", e), vec![]);
         }
     };
@@ -664,7 +688,8 @@ async fn cmd_load(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
         Ok(s) => s,
         Err(e) => {
             room_arc.write().ok().map(|mut r| r.io_locked = false);
-            warn!(room_id, path = %path, %e, "LOAD deserialize failed");
+            let path_display = pathbuf.to_string_lossy();
+            warn!(room_id, path = %path_display, %e, "LOAD deserialize failed");
             return (format!("ERROR invalid_json {}", e), vec![]);
         }
     };
@@ -695,7 +720,8 @@ async fn cmd_load(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
         room.io_locked = false;
     }
 
-    info!(room_id, path = %path, room_counter = new_counter, "LOAD complete");
+    let path_display = pathbuf.to_string_lossy();
+    info!(room_id, path = %path_display, room_counter = new_counter, "LOAD complete");
     (
         "OK".into(),
         vec![RoomUpdate {

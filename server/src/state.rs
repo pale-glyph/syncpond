@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{Arc, RwLock as StdRwLock},
     time::SystemTime,
 };
@@ -104,6 +105,7 @@ impl std::fmt::Display for StateError {
             StateError::RoomIoBusy => write!(f, "room_io_busy"),
         }
     }
+
 }
 
 impl std::error::Error for StateError {}
@@ -146,6 +148,9 @@ pub struct AppState {
     pub jwt_audience: Option<String>,
     pub last_jwt_issue_seconds: Option<u64>,
     pub command_api_key: Option<String>,
+    /// Optional directory path where SAVE/LOAD JSON files will be stored/read.
+    /// If `None`, files are written/read in the current working directory as "<roomid>.json".
+    pub save_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -173,6 +178,7 @@ impl AppState {
             ws_update_dropped: 0,
             ws_update_rate_limited: 0,
             ws_send_errors: 0,
+                save_dir: None,
         }
     }
 
