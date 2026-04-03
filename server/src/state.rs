@@ -148,7 +148,7 @@ pub struct AppState {
     pub jwt_audience: Option<String>,
     pub last_jwt_issue_seconds: Option<u64>,
     pub command_api_key: Option<String>,
-    /// Optional directory path where SAVE/LOAD JSON files will be stored/read.
+    /// Directory path where SAVE/LOAD JSON files will be stored/read.
     pub save_dir: PathBuf,
 }
 
@@ -177,7 +177,7 @@ impl AppState {
             ws_update_dropped: 0,
             ws_update_rate_limited: 0,
             ws_send_errors: 0,
-            save_dir: None,
+            save_dir: PathBuf::from("."),
         }
     }
 
@@ -464,6 +464,12 @@ impl AppState {
         }
         self.command_api_key = Some(key);
         Ok(())
+    }
+
+    /// Set the directory used for SAVE/LOAD operations. Files will be named
+    /// "<roomid>.json" inside this directory.
+    pub fn set_save_dir(&mut self, dir: String) {
+        self.save_dir = PathBuf::from(dir);
     }
 
     /// Generate a JWT for a room with granted containers.

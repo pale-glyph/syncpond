@@ -523,7 +523,7 @@ async fn cmd_save(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
     if !rest.trim().is_empty() {
         return ("ERROR extra_arguments".into(), vec![]);
     }
-    // Determine file path (inside configured save_dir if present).
+    // Determine file path inside configured save_dir.
     // 1. Get the room Arc and configured path, then set io_locked.
     let (room_arc, pathbuf) = {
         let app = state.read().await;
@@ -531,11 +531,7 @@ async fn cmd_save(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
             Some(arc) => arc.clone(),
             None => return (error_of(StateError::RoomNotFound), vec![]),
         };
-        let pb = if let Some(dir) = &app.save_dir {
-            dir.join(format!("{}.json", room_id))
-        } else {
-            std::path::PathBuf::from(format!("{}.json", room_id))
-        };
+        let pb = app.save_dir.join(format!("{}.json", room_id));
         (arc, pb)
     };
     {
@@ -646,7 +642,7 @@ async fn cmd_load(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
     if !rest.trim().is_empty() {
         return ("ERROR extra_arguments".into(), vec![]);
     }
-    // Determine file path (inside configured save_dir if present).
+    // Determine file path inside configured save_dir.
     // 1. Get the room Arc and configured path, then set io_locked.
     let (room_arc, pathbuf) = {
         let app = state.read().await;
@@ -654,11 +650,7 @@ async fn cmd_load(remainder: &str, state: &SharedState) -> (String, Vec<RoomUpda
             Some(arc) => arc.clone(),
             None => return (error_of(StateError::RoomNotFound), vec![]),
         };
-        let pb = if let Some(dir) = &app.save_dir {
-            dir.join(format!("{}.json", room_id))
-        } else {
-            std::path::PathBuf::from(format!("{}.json", room_id))
-        };
+        let pb = app.save_dir.join(format!("{}.json", room_id));
         (arc, pb)
     };
     {

@@ -51,6 +51,7 @@ struct SyncpondConfig {
     ws_allowed_origins: Option<Vec<String>>,
     command_auth_rate_limit: Option<usize>,
     command_auth_rate_window_secs: Option<u64>,
+    save_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -83,6 +84,12 @@ async fn main() -> Result<()> {
     }
     if let Some(ttl) = config.jwt_ttl_seconds {
         base_state.set_jwt_ttl(ttl);
+    }
+
+    // Configure persistence directory (required)
+    match config.save_dir.clone() {
+        Some(dir) if !dir.trim().is_empty() => base_state.set_save_dir(dir),
+        _ => anyhow::bail!("save_dir must be configured and non-empty"),
     }
 
     let shared_state = Arc::new(RwLock::new(base_state));
