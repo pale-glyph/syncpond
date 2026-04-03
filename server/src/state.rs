@@ -327,6 +327,48 @@ impl AppState {
         Ok((fragment.value.clone(), fragment.key_version))
     }
 
+    /// Get whether a fragment has been persisted to disk via SAVE.
+    pub fn get_fragment_persisted(
+        &self,
+        room_id: u64,
+        container: &str,
+        key: &str,
+    ) -> Result<bool, StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+        let container_map = room
+            .containers
+            .get(container)
+            .ok_or(StateError::ContainerNotFound)?;
+        let fragment = container_map.get(key).ok_or(StateError::FragmentNotFound)?;
+        Ok(fragment.persisted)
+    }
+
+    /// Set or unset the persisted flag for a fragment. Returns error if room/container/key missing.
+    pub fn set_fragment_persisted(
+        &self,
+        room_id: u64,
+        container: String,
+        key: String,
+        persisted: bool,
+    ) -> Result<(), StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+        let container_map = room
+            .containers
+            .get_mut(&container)
+            .ok_or(StateError::ContainerNotFound)?;
+        let entry = container_map.get_mut(&key).ok_or(StateError::FragmentNotFound)?;
+        entry.persisted = persisted;
+        Ok(())
+    }
+
     /// Get the room version counter for the specified room.
     pub fn room_version(&self, room_id: u64) -> Result<u64, StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;

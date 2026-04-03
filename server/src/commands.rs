@@ -275,6 +275,99 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
                 Err(e) => (error_of(e), vec![]),
             }
         }
+        "PERSIST.SET" => {
+            let (room_id, rest) = match parse_room_id_from_remainder(remainder) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            let (container, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if let Err(e) = validate_container_name(&container) {
+                return (e, vec![]);
+            }
+            let (key, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if let Err(e) = validate_key_name(&key) {
+                return (e, vec![]);
+            }
+            if !rest.trim().is_empty() {
+                return ("ERROR extra_arguments".into(), vec![]);
+            }
+            let mut app = state.write().await;
+            match app.set_fragment_persisted(room_id, container.clone(), key.clone(), true) {
+                Ok(()) => {
+                    info!(room_id = room_id, container = %container, key = %key, "PERSIST.SET");
+                    ("OK".into(), vec![])
+                }
+                Err(e) => (error_of(e), vec![]),
+            }
+        }
+        "PERSIST.UNSET" => {
+            let (room_id, rest) = match parse_room_id_from_remainder(remainder) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            let (container, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if let Err(e) = validate_container_name(&container) {
+                return (e, vec![]);
+            }
+            let (key, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if let Err(e) = validate_key_name(&key) {
+                return (e, vec![]);
+            }
+            if !rest.trim().is_empty() {
+                return ("ERROR extra_arguments".into(), vec![]);
+            }
+            let mut app = state.write().await;
+            match app.set_fragment_persisted(room_id, container.clone(), key.clone(), false) {
+                Ok(()) => {
+                    info!(room_id = room_id, container = %container, key = %key, "PERSIST.UNSET");
+                    ("OK".into(), vec![])
+                }
+                Err(e) => (error_of(e), vec![]),
+            }
+        }
+        "PERSIST.GET" => {
+            let (room_id, rest) = match parse_room_id_from_remainder(remainder) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            let (container, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if let Err(e) = validate_container_name(&container) {
+                return (e, vec![]);
+            }
+            let (key, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if let Err(e) = validate_key_name(&key) {
+                return (e, vec![]);
+            }
+            if !rest.trim().is_empty() {
+                return ("ERROR extra_arguments".into(), vec![]);
+            }
+            let app = state.read().await;
+            match app.get_fragment_persisted(room_id, &container, &key) {
+                Ok(val) => {
+                    debug!(room_id = room_id, container = %container, key = %key, persisted = val, "PERSIST.GET");
+                    (format!("OK {}", if val { "true" } else { "false" }), vec![])
+                }
+                Err(e) => (error_of(e), vec![]),
+            }
+        }
         "VERSION" => {
             let (room_id, rest) = match parse_room_id_from_remainder(remainder) {
                 Ok(x) => x,
