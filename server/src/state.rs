@@ -14,6 +14,8 @@ pub type SharedState = Arc<RwLock<AppState>>;
 pub struct FragmentEntry {
     pub value: Value,
     pub key_version: u64,
+    /// `true` once this fragment has been written to disk via SAVE.
+    pub persisted: bool,
 }
 
 #[derive(Debug)]
@@ -21,6 +23,9 @@ pub struct RoomState {
     pub containers: HashMap<String, HashMap<String, FragmentEntry>>,
     pub room_counter: u64,
     pub tx_buffer: Option<Vec<RoomCommand>>,
+    /// Set to `true` while a SAVE or LOAD is in progress for this room.
+    /// All other operations against the room will return `RoomIoBusy`.
+    pub io_locked: bool,
 }
 
 #[derive(Debug)]
@@ -74,6 +79,8 @@ pub enum StateError {
     LabelInUse,
     /// Label value is invalid (empty or too long).
     LabelInvalid,
+    /// A SAVE or LOAD operation is currently in progress for this room.
+    RoomIoBusy,
 }
 
 impl std::fmt::Display for StateError {
@@ -94,6 +101,7 @@ impl std::fmt::Display for StateError {
             StateError::LabelNotFound => write!(f, "label_not_found"),
             StateError::LabelInUse => write!(f, "label_in_use"),
             StateError::LabelInvalid => write!(f, "label_invalid"),
+            StateError::RoomIoBusy => write!(f, "room_io_busy"),
         }
     }
 }
@@ -178,6 +186,7 @@ impl AppState {
                 containers: HashMap::new(),
                 room_counter: 0,
                 tx_buffer: None,
+                io_locked: false,
             })),
         );
         room_id
@@ -236,6 +245,9 @@ impl AppState {
     ) -> Result<(), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
 
         if let Some(buffer) = room.tx_buffer.as_mut() {
             buffer.push(RoomCommand::Set {
@@ -249,7 +261,7 @@ impl AppState {
         room.room_counter += 1;
         let key_version = room.room_counter;
         let container_map = room.containers.entry(container).or_default();
-        container_map.insert(key, FragmentEntry { value, key_version });
+        container_map.insert(key, FragmentEntry { value, key_version, persisted: false });
 
         Ok(())
     }
@@ -263,6 +275,9 @@ impl AppState {
     ) -> Result<(), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
 
         if let Some(buffer) = room.tx_buffer.as_mut() {
             buffer.push(RoomCommand::Del { container, key });
@@ -281,6 +296,7 @@ impl AppState {
             FragmentEntry {
                 value: Value::Null,
                 key_version,
+                persisted: false,
             },
         );
         Ok(())
@@ -295,6 +311,9 @@ impl AppState {
     ) -> Result<(Value, u64), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
         let container_map = room
             .containers
             .get(container)
@@ -312,6 +331,9 @@ impl AppState {
     pub fn room_version(&self, room_id: u64) -> Result<u64, StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
         Ok(room.room_counter)
     }
 
@@ -326,6 +348,9 @@ impl AppState {
     pub fn room_info(&self, room_id: u64) -> Result<serde_json::Value, StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
 
         let container_count = room.containers.len();
         let fragment_count: usize = room.containers.values().map(|c| c.len()).sum();
@@ -469,6 +494,9 @@ impl AppState {
     pub fn tx_begin(&self, room_id: u64) -> Result<(), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
         if room.tx_buffer.is_some() {
             return Err(StateError::TxAlreadyOpen);
         }
@@ -480,6 +508,9 @@ impl AppState {
     pub fn tx_end(&self, room_id: u64) -> Result<(), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
         let mut buffer = room.tx_buffer.take().ok_or(StateError::TxNotOpen)?;
 
         for op in buffer.drain(..) {
@@ -492,7 +523,7 @@ impl AppState {
                     room.room_counter += 1;
                     let key_version = room.room_counter;
                     let container_map = room.containers.entry(container).or_default();
-                    container_map.insert(key, FragmentEntry { value, key_version });
+                    container_map.insert(key, FragmentEntry { value, key_version, persisted: false });
                 }
                 RoomCommand::Del { container, key } => {
                     // For semantics, DEL in a transaction always tombstones the key, even if it did
@@ -505,6 +536,7 @@ impl AppState {
                         FragmentEntry {
                             value: Value::Null,
                             key_version,
+                            persisted: false,
                         },
                     );
                 }
@@ -518,6 +550,9 @@ impl AppState {
     pub fn tx_abort(&self, room_id: u64) -> Result<(), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
         room.tx_buffer = None;
         Ok(())
     }
