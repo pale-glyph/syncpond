@@ -16,6 +16,16 @@ This document describes the app-level command protocol used by syncpond administ
 - `SET <room_id> <container> <key> <json>` → `OK` / `ERROR ...`
 - `DEL <room_id> <container> <key>` → `OK` / `ERROR ...`
 - `GET <room_id> <container> <key>` → `OK <json> <version>` / `ERROR tombstone` / `ERROR not_found`
+- `SET <room_id> <container> <key> <json>` → `OK` / `ERROR ...`
+	- Note: the reserved container `server_only` cannot be manipulated via these standard commands.
+		Use the `SERVER.*` commands described below for server-only data.
+- `DEL <room_id> <container> <key>` → `OK` / `ERROR ...`
+- `GET <room_id> <container> <key>` → `OK <json> <version>` / `ERROR tombstone` / `ERROR not_found`
+- `SERVER.SET <room_id> <key> <json>` → `OK` / `ERROR ...`
+	- Sets a key in the reserved `server_only` container. Updates are not broadcast to clients.
+- `SERVER.DEL <room_id> <key>` → `OK` / `ERROR ...`
+	- Tombstones a key in the reserved `server_only` container.
+- `SERVER.GET <room_id> <key>` → `OK <json> <version>` / `ERROR tombstone` / `ERROR not_found`
 - `VERSION <room_id>` → `OK <version>`
 - `SET.JWTKEY <jwt_secret>` → `OK`
 - `TX.BEGIN <room_id>` → `OK`

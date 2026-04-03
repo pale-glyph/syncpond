@@ -17,6 +17,10 @@ pub enum Command {
     Set { room_id: u64, container: String, key: String, value: Value },
     Del { room_id: u64, container: String, key: String },
     Get { room_id: u64, container: String, key: String },
+    /// Server-only operations that operate on the reserved `server_only` container.
+    ServerSet { room_id: u64, key: String, value: Value },
+    ServerDel { room_id: u64, key: String },
+    ServerGet { room_id: u64, key: String },
     Version(u64),
     SetJwtKey(String),
     TxBegin(u64),
@@ -124,6 +128,35 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
                 return Err("ERROR extra_arguments".into());
             }
             Ok(Command::Get { room_id, container, key })
+        }
+        "SERVER.SET" => {
+            let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
+            let (key, rest) = take_token(rest)?;
+            let value_json = rest.trim_start();
+            if value_json.is_empty() {
+                return Err("ERROR missing_value".into());
+            }
+            let value: Value = match serde_json::from_str(value_json) {
+                Ok(v) => v,
+                Err(err) => return Err(format!("ERROR invalid_json {}", err)),
+            };
+            Ok(Command::ServerSet { room_id, key, value })
+        }
+        "SERVER.DEL" => {
+            let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
+            let (key, rest) = take_token(rest)?;
+            if !rest.trim().is_empty() {
+                return Err("ERROR extra_arguments".into());
+            }
+            Ok(Command::ServerDel { room_id, key })
+        }
+        "SERVER.GET" => {
+            let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
+            let (key, rest) = take_token(rest)?;
+            if !rest.trim().is_empty() {
+                return Err("ERROR extra_arguments".into());
+            }
+            Ok(Command::ServerGet { room_id, key })
         }
         "VERSION" => {
             let (room_id, rest) = parse_room_id_from_remainder(remainder)?;
@@ -241,6 +274,10 @@ pub fn format_command(cmd: &Command) -> String {
         }
         Command::Version(id) => format!("VERSION {}", id),
         Command::SetJwtKey(k) => format!("SET.JWTKEY {}", format_token(k)),
+        Command::ServerSet { room_id, key, value } => {
+            let v = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
+            format!("SERVER.SET {} {} {}", room_id, format_token(key), v)
+        }
         Command::TxBegin(id) => format!("TX.BEGIN {}", id),
         Command::TxEnd(id) => format!("TX.END {}", id),
         Command::TxAbort(id) => format!("TX.ABORT {}", id),
@@ -263,6 +300,12 @@ pub fn format_command(cmd: &Command) -> String {
         }
         Command::PersistGet { room_id, container, key } => {
             format!("PERSIST.GET {} {} {}", room_id, format_token(container), format_token(key))
+        }
+        Command::ServerDel { room_id, key } => {
+            format!("SERVER.DEL {} {}", room_id, format_token(key))
+        }
+        Command::ServerGet { room_id, key } => {
+            format!("SERVER.GET {} {}", room_id, format_token(key))
         }
     }
 }

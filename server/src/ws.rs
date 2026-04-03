@@ -117,6 +117,11 @@ impl WsHub {
         let mut disconnected = Vec::new();
 
         for (client_id, client) in room_clients.iter() {
+            // Never forward updates for the reserved server-only container to WS clients.
+            if update.container == "server_only" {
+                continue;
+            }
+
             if update.container != "*"
                 && update.container != "public"
                 && !client.allowed_containers.contains(&update.container)
@@ -239,6 +244,13 @@ fn validate_jwt_claims(app: &AppState, token: &str) -> Result<Claims, String> {
 
     if claims.room.parse::<u64>().is_err() {
         return Err("invalid_jwt_room".to_string());
+    }
+
+    // Reject tokens that attempt to grant access to the reserved server-only container.
+    if let Some(containers) = &claims.containers {
+        if containers.iter().any(|c| c == "server_only") {
+            return Err("invalid_jwt_reserved_container".to_string());
+        }
     }
 
     Ok(claims)
@@ -396,6 +408,8 @@ pub async fn handle_ws_connection(
     let mut allowed_containers: HashSet<String> =
         claims.containers.unwrap_or_default().into_iter().collect();
     allowed_containers.insert("public".to_string());
+    // Ensure reserved container isn't accidentally granted to the WS client's allowed set.
+    allowed_containers.remove("server_only");
 
     debug!(%peer, room_id = room_id, "acquiring state.read for room snapshot");
     let room_state_snapshot = {

@@ -61,6 +61,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_and_format_server_commands() {
+        use serde_json::json;
+
+        let s = "SERVER.SET 1 mykey {\"a\":1}";
+        let cmd = parse_command(s).unwrap();
+        assert_eq!(cmd, Command::ServerSet { room_id: 1, key: "mykey".into(), value: json!({"a":1}) });
+        assert_eq!(format_command(&cmd), "SERVER.SET 1 mykey {\"a\":1}");
+
+        let s2 = "SERVER.DEL 1 mykey";
+        let cmd2 = parse_command(s2).unwrap();
+        assert_eq!(cmd2, Command::ServerDel { room_id: 1, key: "mykey".into() });
+        assert_eq!(format_command(&cmd2), "SERVER.DEL 1 mykey");
+
+        let s3 = "SERVER.GET 1 mykey";
+        let cmd3 = parse_command(s3).unwrap();
+        assert_eq!(cmd3, Command::ServerGet { room_id: 1, key: "mykey".into() });
+        assert_eq!(format_command(&cmd3), "SERVER.GET 1 mykey");
+    }
+
+    #[test]
     fn parse_and_format_save_load_commands() {
         let s = "SAVE 1";
         let cmd = parse_command(s).unwrap();

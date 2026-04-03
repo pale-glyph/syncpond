@@ -160,6 +160,10 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
             if let Err(e) = validate_container_name(&container) {
                 return (e, vec![]);
             }
+            // Standard SET may not manipulate the reserved server-only container.
+            if container == "server_only" {
+                return (error_of(crate::state::StateError::ReservedContainerName), vec![]);
+            }
             let (key, rest) = match take_token(rest) {
                 Ok(x) => x,
                 Err(err) => return (err, vec![]),
@@ -210,6 +214,10 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
             if let Err(e) = validate_container_name(&container) {
                 return (e, vec![]);
             }
+            // Standard DEL may not manipulate the reserved server-only container.
+            if container == "server_only" {
+                return (error_of(crate::state::StateError::ReservedContainerName), vec![]);
+            }
             let (key, rest) = match take_token(rest) {
                 Ok(x) => x,
                 Err(err) => return (err, vec![]),
@@ -254,6 +262,10 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
             };
             if let Err(e) = validate_container_name(&container) {
                 return (e, vec![]);
+            }
+            // Standard GET may not access the reserved server-only container.
+            if container == "server_only" {
+                return (error_of(crate::state::StateError::ReservedContainerName), vec![]);
             }
             let (key, rest) = match take_token(rest) {
                 Ok(x) => x,
@@ -397,6 +409,106 @@ pub async fn process_command(line: &str, state: &SharedState) -> (String, Vec<Ro
             app.set_jwt_key(key);
             info!("SET.JWTKEY called (key hidden)");
             ("OK".into(), vec![])
+        }
+        "SERVER.SET" => {
+            let (room_id, rest) = match parse_room_id_from_remainder(remainder) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            let (key, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if let Err(e) = validate_key_name(&key) {
+                return (e, vec![]);
+            }
+            let value_json = rest.trim_start();
+            if value_json.is_empty() {
+                return ("ERROR missing_value".into(), vec![]);
+            }
+            let value: Value = match serde_json::from_str(value_json) {
+                Ok(v) => v,
+                Err(err) => return (format!("ERROR invalid_json {}", err), vec![]),
+            };
+            let mut app = state.write().await;
+            match app.set_fragment(room_id, "server_only".to_string(), key.clone(), value.clone()) {
+                Ok(()) => {
+                    let room_counter = app
+                        .rooms
+                        .get(&room_id)
+                        .and_then(|r| r.read().ok().map(|room| room.room_counter))
+                        .unwrap_or(0);
+                    info!(room_id = room_id, key = %key, "SERVER.SET");
+                    (
+                        "OK".into(),
+                        vec![RoomUpdate {
+                            room_id,
+                            container: "server_only".to_string(),
+                            key,
+                            value: Some(value),
+                            room_counter,
+                        }],
+                    )
+                }
+                Err(e) => (error_of(e), vec![]),
+            }
+        }
+        "SERVER.DEL" => {
+            let (room_id, rest) = match parse_room_id_from_remainder(remainder) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            let (key, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if !rest.trim().is_empty() {
+                return ("ERROR extra_arguments".into(), vec![]);
+            }
+            let mut app = state.write().await;
+            match app.del_fragment(room_id, "server_only".to_string(), key.clone()) {
+                Ok(()) => {
+                    let room_counter = app
+                        .rooms
+                        .get(&room_id)
+                        .and_then(|r| r.read().ok().map(|room| room.room_counter))
+                        .unwrap_or(0);
+                    info!(room_id = room_id, key = %key, "SERVER.DEL");
+                    (
+                        "OK".into(),
+                        vec![RoomUpdate {
+                            room_id,
+                            container: "server_only".to_string(),
+                            key,
+                            value: None,
+                            room_counter,
+                        }],
+                    )
+                }
+                Err(e) => (error_of(e), vec![]),
+            }
+        }
+        "SERVER.GET" => {
+            let (room_id, rest) = match parse_room_id_from_remainder(remainder) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            let (key, rest) = match take_token(rest) {
+                Ok(x) => x,
+                Err(err) => return (err, vec![]),
+            };
+            if !rest.trim().is_empty() {
+                return ("ERROR extra_arguments".into(), vec![]);
+            }
+            let app = state.read().await;
+            match app.get_fragment(room_id, "server_only", &key) {
+                Ok((v, kv)) => {
+                    let value_text = serde_json::to_string(&v).unwrap_or_else(|_| "null".into());
+                    debug!(room_id = room_id, key = %key, "SERVER.GET");
+                    (format!("OK {} {}", value_text, kv), vec![])
+                }
+                Err(e) => (error_of(e), vec![]),
+            }
         }
         "TX.BEGIN" => {
             let (room_id, rest) = match parse_room_id_from_remainder(remainder) {

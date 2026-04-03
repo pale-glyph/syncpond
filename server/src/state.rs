@@ -71,6 +71,8 @@ pub enum StateError {
 
     /// JWT key is too weak.
     JwtKeyTooShort,
+    /// Container name reserved for server-only data; cannot be granted to clients via JWTs.
+    ReservedContainerName,
 
     /// Command API key is blank/invalid.
     CommandApiKeyInvalid,
@@ -98,6 +100,7 @@ impl std::fmt::Display for StateError {
                 write!(f, "jwt_issuer_audience_not_configured")
             }
             StateError::JwtKeyTooShort => write!(f, "jwt_key_too_short"),
+            StateError::ReservedContainerName => write!(f, "reserved_container_name"),
             StateError::CommandApiKeyInvalid => write!(f, "command_api_key_invalid"),
             StateError::LabelNotFound => write!(f, "label_not_found"),
             StateError::LabelInUse => write!(f, "label_in_use"),
@@ -498,6 +501,12 @@ impl AppState {
         if !self.rooms.contains_key(&room_id) {
             return Err(StateError::RoomNotFound);
         }
+        // Reject attempts to include reserved server-only container in JWT grants.
+        for c in containers.iter() {
+            if c == "server_only" {
+                return Err(StateError::ReservedContainerName);
+            }
+        }
 
         let mut container_set: HashSet<String> = containers.iter().cloned().collect();
         container_set.insert("public".to_string());
@@ -621,6 +630,11 @@ impl AppState {
         let mut containers_json = serde_json::Map::new();
 
         for (container_name, fragments) in &room.containers {
+            // Never expose the server-only container to clients.
+            if container_name == "server_only" {
+                continue;
+            }
+
             if container_name == "public" || allowed_containers.contains(container_name) {
                 let mut container_map = serde_json::Map::new();
                 for (key, entry) in fragments {
@@ -661,6 +675,11 @@ impl AppState {
         let mut containers_json = serde_json::Map::new();
 
         for (container_name, fragments) in &room.containers {
+            // Never include server-only container in deltas sent to clients.
+            if container_name == "server_only" {
+                continue;
+            }
+
             if container_name != "public" && !allowed_containers.contains(container_name) {
                 continue;
             }
