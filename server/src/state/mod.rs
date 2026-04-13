@@ -1,3 +1,5 @@
+pub mod rooms;
+
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

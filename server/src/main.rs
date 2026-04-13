@@ -10,6 +10,8 @@ mod commands;
 mod rate_limiter;
 mod state;
 mod ws;
+mod auth;
+mod upstream;
 
 use crate::commands::process_command;
 use crate::rate_limiter::RateLimiter;
