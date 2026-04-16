@@ -35,6 +35,7 @@ struct SyncpondConfig {
     command_api_key: String,
     ws_addr: Option<String>,
     command_addr: Option<String>,
+    upstream_grpc_addr: Option<String>,
     health_addr: Option<String>,
     jwt_key: Option<String>,
     jwt_issuer: Option<String>,
@@ -175,6 +176,13 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("invalid health_addr: {}", health_addr))?;
 
+    let grpc_addr = config
+        .upstream_grpc_addr
+        .unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    let grpc_addr: SocketAddr = grpc_addr
+        .parse()
+        .with_context(|| format!("invalid upstream_grpc_addr: {}", grpc_addr))?;
+
     if health_bind_loopback_only && !health_addr.ip().is_loopback() {
         anyhow::bail!("health_bind_loopback_only=true but health_addr is not loopback");
     }
@@ -305,6 +313,21 @@ async fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
+    // start upstream gRPC server for trusted application servers
+    let grpc_state = shared_state.clone();
+    let grpc_addr_for_task = grpc_addr.clone();
+    let grpc_server = tokio::spawn(async move {
+        info!("syncpond upstream gRPC server listening on {}", grpc_addr_for_task);
+        let server = crate::upstream::GrpcServer::new(crate::upstream::CommandServer::new(), grpc_state);
+        server
+            .serve(grpc_addr_for_task)
+            .await
+            .map_err(|e| anyhow::anyhow!("grpc bind failed: {}", e))?;
+
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    });
+
     let shutdown = async {
         tokio::signal::ctrl_c()
             .await
@@ -318,6 +341,7 @@ async fn main() -> Result<()> {
         res = ws_server => res??,
         res = command_server => res??,
         res = health_server => res??,
+        res = grpc_server => res??,
     }
 
     info!("server shutdown complete");
