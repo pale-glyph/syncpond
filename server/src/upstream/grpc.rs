@@ -72,6 +72,97 @@ impl CommandService for CommandServiceImpl {
             }
         }
     }
+
+    async fn create_bucket(
+        &self,
+        request: Request<proto::CreateBucketRequest>,
+    ) -> Result<Response<proto::CreateBucketResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+        let bucket_id = req.bucket_id;
+
+        match self.inner.create_bucket(room_id, bucket_id).await {
+            Ok(()) => Ok(Response::new(proto::CreateBucketResponse {})),
+            Err(e) => Err(Status::internal(e)),
+        }
+    }
+
+    async fn delete_bucket(
+        &self,
+        request: Request<proto::DeleteBucketRequest>,
+    ) -> Result<Response<proto::DeleteBucketResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+        let bucket_id = req.bucket_id;
+
+        match self.inner.delete_bucket(room_id, bucket_id).await {
+            Ok(()) => Ok(Response::new(proto::DeleteBucketResponse {})),
+            Err(e) => Err(Status::not_found(e)),
+        }
+    }
+
+    async fn list_buckets(
+        &self,
+        request: Request<proto::ListBucketsRequest>,
+    ) -> Result<Response<proto::ListBucketsResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+
+        let ids = self.inner.list_buckets(room_id).await;
+        Ok(Response::new(proto::ListBucketsResponse { bucket_ids: ids }))
+    }
+
+    async fn set_room_label(
+        &self,
+        request: Request<proto::SetRoomLabelRequest>,
+    ) -> Result<Response<proto::SetRoomLabelResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+        let label = req.label;
+
+        match self.inner.set_room_label(room_id, label).await {
+            Ok(()) => Ok(Response::new(proto::SetRoomLabelResponse {})),
+            Err(e) => Err(Status::not_found(e)),
+        }
+    }
+
+    async fn get_room_label(
+        &self,
+        request: Request<proto::GetRoomLabelRequest>,
+    ) -> Result<Response<proto::GetRoomLabelResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+
+        let label = self.inner.get_room_label(room_id).await;
+        Ok(Response::new(proto::GetRoomLabelResponse { label: label.unwrap_or_default() }))
+    }
+
+    async fn set_bucket_label(
+        &self,
+        request: Request<proto::SetBucketLabelRequest>,
+    ) -> Result<Response<proto::SetBucketLabelResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+        let bucket_id = req.bucket_id;
+        let label = req.label;
+
+        match self.inner.set_bucket_label(room_id, bucket_id, label).await {
+            Ok(()) => Ok(Response::new(proto::SetBucketLabelResponse {})),
+            Err(e) => Err(Status::not_found(e)),
+        }
+    }
+
+    async fn get_bucket_label(
+        &self,
+        request: Request<proto::GetBucketLabelRequest>,
+    ) -> Result<Response<proto::GetBucketLabelResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+        let bucket_id = req.bucket_id;
+
+        let label = self.inner.get_bucket_label(room_id, bucket_id).await;
+        Ok(Response::new(proto::GetBucketLabelResponse { label: label.unwrap_or_default() }))
+    }
 }
 
 /// A small gRPC server wrapper around the upstream `CommandServer`.

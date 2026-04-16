@@ -39,6 +39,9 @@ pub struct RoomState {
     /// Set to `true` while a SAVE or LOAD is in progress for this room.
     /// All other operations against the room will return `RoomIoBusy`.
     pub io_locked: bool,
+    /// Optional human-friendly labels for buckets in this room.
+    /// Maps numeric bucket id -> label string.
+    pub bucket_labels: HashMap<u64, String>,
 }
 
 #[derive(Debug)]
@@ -207,6 +210,7 @@ impl AppState {
                 room_counter: 0,
                 tx_buffer: None,
                 io_locked: false,
+                bucket_labels: HashMap::new(),
             })),
         );
         room_id
@@ -253,6 +257,49 @@ impl AppState {
             .get(label_trimmed)
             .copied()
             .ok_or(StateError::LabelNotFound)
+    }
+
+    /// Get the first label associated with a room, if any.
+    pub fn get_room_label(&self, room_id: u64) -> Option<String> {
+        for (label, &rid) in &self.labels {
+            if rid == room_id {
+                return Some(label.clone());
+            }
+        }
+        None
+    }
+
+    /// Set a human-friendly label for a bucket in a room. Labels are informational
+    /// only and do not need to be unique across buckets or rooms.
+    pub fn set_bucket_label(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), StateError> {
+        let label_trimmed = label.trim();
+        if label_trimmed.is_empty() || label_trimmed.len() > 256 {
+            return Err(StateError::LabelInvalid);
+        }
+
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+
+        // Ensure the bucket/container exists
+        let bucket_name = format!("bucket_{}", bucket_id);
+        if !room.containers.contains_key(&bucket_name) {
+            return Err(StateError::ContainerNotFound);
+        }
+
+        room.bucket_labels.insert(bucket_id, label_trimmed.to_string());
+        Ok(())
+    }
+
+    /// Get the label for a bucket if present.
+    pub fn get_bucket_label(&self, room_id: u64, bucket_id: u64) -> Option<String> {
+        let room_arc = self.rooms.get(&room_id)?;
+        if let Ok(room) = room_arc.read() {
+            return room.bucket_labels.get(&bucket_id).cloned();
+        }
+        None
     }
 
     /// Set a fragment value in a container within a room.
