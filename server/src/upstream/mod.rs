@@ -44,4 +44,13 @@ impl CommandServer {
     pub async fn delete_room(&self, room_id: u64) -> Result<(), String> {
         self.kernel.delete_room(room_id).await
     }
+
+    pub async fn issue_jwt(&self, room_id: u64, containers: Vec<String>) -> Result<String, String> {
+        // Delegate to AppState's create_room_token helper which performs validation
+        let mut app = self.kernel.state.write().await;
+        match app.create_room_token(room_id, &containers) {
+            Ok(tok) => Ok(tok),
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }

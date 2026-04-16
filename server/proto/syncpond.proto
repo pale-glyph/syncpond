@@ -11,8 +11,12 @@ message ListRoomsResponse { repeated uint64 room_ids = 1; }
 message DeleteRoomRequest { uint64 room_id = 1; }
 message DeleteRoomResponse {}
 
+message IssueJwtRequest { uint64 room_id = 1; repeated string containers = 2; }
+message IssueJwtResponse { string jwt = 1; }
+
 service CommandService {
   rpc NewRoom (NewRoomRequest) returns (NewRoomResponse);
   rpc ListRooms (ListRoomsRequest) returns (ListRoomsResponse);
   rpc DeleteRoom (DeleteRoomRequest) returns (DeleteRoomResponse);
+  rpc IssueJwt (IssueJwtRequest) returns (IssueJwtResponse);
 }
