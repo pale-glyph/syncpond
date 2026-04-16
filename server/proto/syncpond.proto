@@ -14,26 +14,16 @@ message DeleteRoomResponse {}
 message IssueJwtRequest { uint64 room_id = 1; repeated string containers = 2; }
 message IssueJwtResponse { string jwt = 1; }
 
-message CreateBucketRequest { uint64 room_id = 1; uint64 bucket_id = 2; }
+message CreateBucketRequest { uint64 room_id = 1; uint64 bucket_id = 2; string label = 3; }
 message CreateBucketResponse {}
 
 message DeleteBucketRequest { uint64 room_id = 1; uint64 bucket_id = 2; }
 message DeleteBucketResponse {}
 
 message ListBucketsRequest { uint64 room_id = 1; }
-message ListBucketsResponse { repeated uint64 bucket_ids = 1; }
+message ListBucketsResponse { repeated string buckets = 1; }
 
-message SetRoomLabelRequest { uint64 room_id = 1; string label = 2; }
-message SetRoomLabelResponse {}
-
-message GetRoomLabelRequest { uint64 room_id = 1; }
-message GetRoomLabelResponse { string label = 1; }
-
-message SetBucketLabelRequest { uint64 room_id = 1; uint64 bucket_id = 2; string label = 3; }
-message SetBucketLabelResponse {}
-
-message GetBucketLabelRequest { uint64 room_id = 1; uint64 bucket_id = 2; }
-message GetBucketLabelResponse { string label = 1; }
+// Room/bucket labels are set at creation time; no separate get/set RPCs.
 
 service CommandService {
   rpc NewRoom (NewRoomRequest) returns (NewRoomResponse);
@@ -43,8 +33,4 @@ service CommandService {
   rpc CreateBucket (CreateBucketRequest) returns (CreateBucketResponse);
   rpc DeleteBucket (DeleteBucketRequest) returns (DeleteBucketResponse);
   rpc ListBuckets (ListBucketsRequest) returns (ListBucketsResponse);
-  rpc SetRoomLabel (SetRoomLabelRequest) returns (SetRoomLabelResponse);
-  rpc GetRoomLabel (GetRoomLabelRequest) returns (GetRoomLabelResponse);
-  rpc SetBucketLabel (SetBucketLabelRequest) returns (SetBucketLabelResponse);
-  rpc GetBucketLabel (GetBucketLabelRequest) returns (GetBucketLabelResponse);
 }

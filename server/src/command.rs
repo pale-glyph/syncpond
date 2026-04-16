@@ -13,7 +13,7 @@ pub enum Commands {
     CloseRoom(RoomId),
 
     // Bucket handling
-    CreateBucket(RoomId, BucketId),
+    CreateBucket(RoomId, BucketId, String),
     DeleteBucket(RoomId, BucketId),
 
     // Fragment handling

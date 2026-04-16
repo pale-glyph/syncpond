@@ -61,9 +61,10 @@ impl CommandServer {
     }
 
     /// Create a bucket for a room. Bucket id is numeric and will be translated
-    /// into an internal container name `bucket_<id>`.
-    pub async fn create_bucket(&self, room_id: u64, bucket_id: u64) -> Result<(), String> {
-        match self.kernel.handle_command(Commands::CreateBucket(room_id, bucket_id)).await {
+    /// into an internal container name `bucket_<id>`. A label may be provided
+    /// and will be stored at creation time for convenience on the client.
+    pub async fn create_bucket(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::CreateBucket(room_id, bucket_id, label)).await {
             CommandResponse::CreateBucketResponse => Ok(()),
             _ => Err("create_bucket_failed".to_string()),
         }
@@ -76,8 +77,9 @@ impl CommandServer {
         }
     }
 
-    /// List numeric bucket ids for a given room by scanning container names.
-    pub async fn list_buckets(&self, room_id: u64) -> Vec<u64> {
+    /// List bucket ids for a given room and include labels formatted as
+    /// "<id>:<label>" for client convenience.
+    pub async fn list_buckets(&self, room_id: u64) -> Vec<String> {
         let app = self.kernel.state.read().await;
         if let Some(room_arc) = app.rooms.get(&room_id) {
             if let Ok(room) = room_arc.read() {
@@ -93,37 +95,18 @@ impl CommandServer {
                     })
                     .collect();
                 ids.sort_unstable();
-                return ids;
+                return ids
+                    .into_iter()
+                    .map(|id| {
+                        let label = room.bucket_labels.get(&id).cloned().unwrap_or_default();
+                        format!("{}:{}", id, label)
+                    })
+                    .collect();
             }
         }
 
         Vec::new()
     }
 
-    pub async fn set_room_label(&self, room_id: u64, label: String) -> Result<(), String> {
-        let mut app = self.kernel.state.write().await;
-        match app.set_room_label(room_id, label) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    pub async fn get_room_label(&self, room_id: u64) -> Option<String> {
-        let app = self.kernel.state.read().await;
-        app.get_room_label(room_id)
-    }
-
-    pub async fn set_bucket_label(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), String> {
-        let app = self.kernel.state.clone();
-        let mut guard = app.write().await;
-        match guard.set_bucket_label(room_id, bucket_id, label) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    pub async fn get_bucket_label(&self, room_id: u64, bucket_id: u64) -> Option<String> {
-        let app = self.kernel.state.read().await;
-        app.get_bucket_label(room_id, bucket_id)
-    }
+    // Room/bucket labels are set only at creation time; label get/set RPCs removed.
 }

@@ -61,13 +61,16 @@ impl SyncpondKernel {
                     }
                 }
             }
-            Commands::CreateBucket(room_id, bucket_id) => {
-                // Create a named container for the given bucket id.
+            Commands::CreateBucket(room_id, bucket_id, label) => {
+                // Create a named container for the given bucket id and set optional label.
                 let mut app = self.state.write().await;
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     if let Ok(mut room) = room_arc.write() {
                         let bucket_name = format!("bucket_{}", bucket_id);
                         room.containers.entry(bucket_name).or_insert_with(HashMap::new);
+                        if !label.trim().is_empty() {
+                            room.bucket_labels.insert(bucket_id, label);
+                        }
                     }
                 }
                 CommandResponse::CreateBucketResponse
