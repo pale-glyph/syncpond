@@ -9,8 +9,6 @@ pub mod proto {
 }
 
 use proto::command_service_server::{CommandService, CommandServiceServer};
-
-
 #[derive(Clone)]
 struct CommandServiceImpl {
     inner: Arc<super::CommandServer>,
@@ -18,90 +16,37 @@ struct CommandServiceImpl {
 
 #[tonic::async_trait]
 impl CommandService for CommandServiceImpl {
-    async fn handle(
+    async fn new_room(
         &self,
-        request: Request<proto::CommandRequest>,
-    ) -> Result<Response<proto::CommandResponse>, Status> {
+        request: Request<proto::NewRoomRequest>,
+    ) -> Result<Response<proto::NewRoomResponse>, Status> {
         let req = request.into_inner();
+        let name = req.name;
 
-        let proto_cmd = req.command.ok_or_else(|| Status::invalid_argument("missing command"))?;
+        let resp = self.inner.new_room(name).await;
 
-        let internal_cmd = match proto_cmd {
-            proto::command_request::Command::NewRoom(n) => {
-                super::Commands::NewRoom(n.name)
-            }
-            proto::command_request::Command::CloseRoom(c) => {
-                super::Commands::CloseRoom(c.room_id)
-            }
-            proto::command_request::Command::CreateBucket(c) => {
-                super::Commands::CreateBucket(c.room_id, c.bucket_id)
-            }
-            proto::command_request::Command::DeleteBucket(d) => {
-                super::Commands::DeleteBucket(d.room_id, d.bucket_id)
-            }
-            proto::command_request::Command::WriteFragment(w) => {
-                super::Commands::WriteFragment(w.room_id, w.fragment_id, w.data)
-            }
-            proto::command_request::Command::SetFragmentFlags(s) => {
-                // convert flags (u32) -> u16 -> FragmentFlags
-                let flags = super::FragmentFlags::from_bits(s.flags as u16);
-                super::Commands::SetFragmentFlags(s.room_id, s.fragment_id, flags)
-            }
-            proto::command_request::Command::ReadFragment(r) => {
-                super::Commands::ReadFragment(r.room_id, r.fragment_id)
-            }
-        };
+        Ok(Response::new(proto::NewRoomResponse { room_id: resp }))
+    }
 
-        let resp = self.inner.handle_command(internal_cmd).await;
+    async fn list_rooms(
+        &self,
+        _request: Request<proto::ListRoomsRequest>,
+    ) -> Result<Response<proto::ListRoomsResponse>, Status> {
+        let list = self.inner.list_rooms().await;
+        Ok(Response::new(proto::ListRoomsResponse { room_ids: list }))
+    }
 
-        let proto_resp = match resp {
-            super::CommandResponse::NewRoomResponse(room_id) => proto::CommandResponse {
-                response: Some(proto::command_response::Response::NewRoomResponse(
-                    proto::NewRoomResponse { room_id },
-                )),
-            },
-            super::CommandResponse::CloseRoomResponse => proto::CommandResponse {
-                response: Some(proto::command_response::Response::CloseRoomResponse(
-                    proto::CloseRoomResponse {},
-                )),
-            },
-            super::CommandResponse::CreateBucketResponse => proto::CommandResponse {
-                response: Some(proto::command_response::Response::CreateBucketResponse(
-                    proto::CreateBucketResponse {},
-                )),
-            },
-            super::CommandResponse::DeleteBucketResponse => proto::CommandResponse {
-                response: Some(proto::command_response::Response::DeleteBucketResponse(
-                    proto::DeleteBucketResponse {},
-                )),
-            },
-            super::CommandResponse::FragmentWriteResponse => proto::CommandResponse {
-                response: Some(proto::command_response::Response::FragmentWriteResponse(
-                    proto::FragmentWriteResponse {},
-                )),
-            },
-            super::CommandResponse::SetFragmentFlagsResponse => proto::CommandResponse {
-                response: Some(proto::command_response::Response::SetFragmentFlagsResponse(
-                    proto::SetFragmentFlagsResponse {},
-                )),
-            },
-            super::CommandResponse::FragmentReadResponse(opt) => {
-                match opt {
-                    Some(data) => proto::CommandResponse {
-                        response: Some(proto::command_response::Response::FragmentReadResponse(
-                            proto::FragmentReadResponse { data, exists: true },
-                        )),
-                    },
-                    None => proto::CommandResponse {
-                        response: Some(proto::command_response::Response::FragmentReadResponse(
-                            proto::FragmentReadResponse { data: Vec::new(), exists: false },
-                        )),
-                    },
-                }
-            }
-        };
+    async fn delete_room(
+        &self,
+        request: Request<proto::DeleteRoomRequest>,
+    ) -> Result<Response<proto::DeleteRoomResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
 
-        Ok(Response::new(proto_resp))
+        match self.inner.delete_room(room_id).await {
+            Ok(()) => Ok(Response::new(proto::DeleteRoomResponse {})),
+            Err(e) => Err(Status::not_found(e)),
+        }
     }
 }
 

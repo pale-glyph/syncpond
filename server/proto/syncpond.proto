@@ -2,46 +2,17 @@ syntax = "proto3";
 
 package syncpond.upstream;
 
-message CommandRequest {
-  oneof command {
-    NewRoomCommand new_room = 1;
-    CloseRoomCommand close_room = 2;
-    CreateBucketCommand create_bucket = 3;
-    DeleteBucketCommand delete_bucket = 4;
-    WriteFragmentCommand write_fragment = 5;
-    SetFragmentFlagsCommand set_fragment_flags = 6;
-    ReadFragmentCommand read_fragment = 7;
-  }
-}
-
-message NewRoomCommand { string name = 1; }
-message CloseRoomCommand { uint64 room_id = 1; }
-message CreateBucketCommand { uint64 room_id = 1; uint64 bucket_id = 2; }
-message DeleteBucketCommand { uint64 room_id = 1; uint64 bucket_id = 2; }
-message WriteFragmentCommand { uint64 room_id = 1; uint64 fragment_id = 2; bytes data = 3; }
-message SetFragmentFlagsCommand { uint64 room_id = 1; uint64 fragment_id = 2; uint32 flags = 3; }
-message ReadFragmentCommand { uint64 room_id = 1; uint64 fragment_id = 2; }
-
-message CommandResponse {
-  oneof response {
-    NewRoomResponse new_room_response = 1;
-    CloseRoomResponse close_room_response = 2;
-    CreateBucketResponse create_bucket_response = 3;
-    DeleteBucketResponse delete_bucket_response = 4;
-    FragmentWriteResponse fragment_write_response = 5;
-    SetFragmentFlagsResponse set_fragment_flags_response = 6;
-    FragmentReadResponse fragment_read_response = 7;
-  }
-}
-
+message NewRoomRequest { string name = 1; }
 message NewRoomResponse { uint64 room_id = 1; }
-message CloseRoomResponse {}
-message CreateBucketResponse {}
-message DeleteBucketResponse {}
-message FragmentWriteResponse {}
-message SetFragmentFlagsResponse {}
-message FragmentReadResponse { bytes data = 1; bool exists = 2; }
+
+message ListRoomsRequest {}
+message ListRoomsResponse { repeated uint64 room_ids = 1; }
+
+message DeleteRoomRequest { uint64 room_id = 1; }
+message DeleteRoomResponse {}
 
 service CommandService {
-  rpc Handle (CommandRequest) returns (CommandResponse);
+  rpc NewRoom (NewRoomRequest) returns (NewRoomResponse);
+  rpc ListRooms (ListRoomsRequest) returns (ListRoomsResponse);
+  rpc DeleteRoom (DeleteRoomRequest) returns (DeleteRoomResponse);
 }

@@ -1,98 +1,47 @@
 use super::state::rooms::FragmentFlags;
+use std::sync::Arc;
 
 pub mod grpc;
 pub use grpc::GrpcServer;
 
-pub struct CommandServer {}
+pub use crate::command::{Commands, CommandResponse};
 
-type RoomName = String;
-
-type RoomId = u64;
-type BucketId = u64;
-
-type FragmentId = u64;
-type FragmentData = Vec<u8>;
-
-enum Commands {
-    // Room handling
-    NewRoom(RoomName),
-    CloseRoom(RoomId),
-
-    // Bucket handling
-    CreateBucket(RoomId, BucketId), // room ID and bucket ID
-    DeleteBucket(RoomId, BucketId), // room ID and bucket ID
-
-    // Fragment handling
-    WriteFragment(RoomId, FragmentId, FragmentData),
-    SetFragmentFlags(RoomId, FragmentId, FragmentFlags),
-    ReadFragment(RoomId, FragmentId),
-}
-
-enum CommandResponse {
-    // Room handling responses
-    NewRoomResponse(RoomId),
-    CloseRoomResponse,
-
-    // Bucket handling responses
-    CreateBucketResponse,
-    DeleteBucketResponse,
-
-    // Fragment handling responses
-    FragmentWriteResponse,
-    SetFragmentFlagsResponse,
-    FragmentReadResponse(Option<FragmentData>),
+/// Thin CommandServer wrapper that delegates command execution to the
+/// `SyncpondKernel` provided at construction time.
+pub struct CommandServer {
+    kernel: Arc<crate::kernel::SyncpondKernel>,
 }
 
 impl CommandServer {
-    pub fn new() -> Self {
-        CommandServer {}
+    pub fn new(kernel: Arc<crate::kernel::SyncpondKernel>) -> Self {
+        CommandServer { kernel }
     }
 
     pub async fn start(&self) {
-        // Start the command server
+        // nothing to run for now; kept for API compatibility
     }
 
     pub async fn stop(&self) {
-        // Stop the command server
+        // nothing to stop for now
     }
 
     pub async fn handle_command(&self, command: Commands) -> CommandResponse {
-        match command {
-            Commands::NewRoom(name) => {
-                // Handle new room command
-                // TODO implement
-                return CommandResponse::NewRoomResponse(0);
-            }
-            Commands::CloseRoom(room_id) => {
-                // Handle close room command
-                // TODO implement
-                return CommandResponse::CloseRoomResponse;
-            }
-            Commands::CreateBucket(room_id, bucket_id) => {
-                // Handle create bucket command
-                // TODO implement
-                return CommandResponse::CreateBucketResponse;
-            }
-            Commands::DeleteBucket(room_id, bucket_id) => {
-                // Handle delete bucket command
-                // TODO implement
-                return CommandResponse::DeleteBucketResponse;
-            }
-            Commands::WriteFragment(room_id, fragment_id, data) => {
-                // Handle write fragment command
-                // TODO implement
-                return CommandResponse::FragmentWriteResponse;
-            }
-            Commands::SetFragmentFlags(room_id, fragment_id, flags) => {
-                // Handle set fragment flags command
-                // TODO implement
-                return CommandResponse::SetFragmentFlagsResponse;
-            }
-            Commands::ReadFragment(room_id, fragment_id) => {
-                // Handle read fragment command
-                // TODO implement
-                return CommandResponse::FragmentReadResponse(None);
-            }
+        self.kernel.handle_command(command).await
+    }
+
+    pub async fn new_room(&self, name: String) -> u64 {
+        match self.kernel.handle_command(Commands::NewRoom(name)).await {
+            CommandResponse::NewRoomResponse(id) => id,
+            _ => 0,
         }
+    }
+
+    pub async fn list_rooms(&self) -> Vec<u64> {
+        let app = self.kernel.state.read().await;
+        app.list_rooms()
+    }
+
+    pub async fn delete_room(&self, room_id: u64) -> Result<(), String> {
+        self.kernel.delete_room(room_id).await
     }
 }

@@ -9,6 +9,8 @@
 mod rate_limiter;
 mod state;
 mod downstream;
+mod kernel;
+mod command;
 mod upstream;
 
 use crate::rate_limiter::RateLimiter;
@@ -99,10 +101,10 @@ async fn main() -> Result<()> {
     let ws_auth_rate_window_secs = config
         .ws_auth_rate_window_secs
         .unwrap_or(DEFAULT_WS_AUTH_RATE_WINDOW_SECS);
-    let _ws_room_rate_limit = config
+    let ws_room_rate_limit = config
         .ws_room_rate_limit
         .unwrap_or(DEFAULT_WS_ROOM_RATE_LIMIT);
-    let _ws_room_rate_window_secs = config
+    let ws_room_rate_window_secs = config
         .ws_room_rate_window_secs
         .unwrap_or(DEFAULT_WS_ROOM_RATE_WINDOW_SECS);
     let ws_allowed_origins = config.ws_allowed_origins.clone().unwrap_or_else(|| {
@@ -227,12 +229,22 @@ async fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
+    // build the Kernel which coordinates state and downstream components
+    let kernel = Arc::new(crate::kernel::SyncpondKernel::new(
+        shared_state.clone(),
+        ws_hub.clone(),
+        ws_room_rate_limiter.clone(),
+        ws_room_rate_limit,
+        ws_room_rate_window_secs,
+    ));
+
     // start upstream gRPC server for trusted application servers
     let grpc_state = shared_state.clone();
     let grpc_addr_for_task = grpc_addr.clone();
+    let kernel_for_grpc = kernel.clone();
     let grpc_server = tokio::spawn(async move {
         info!("syncpond upstream gRPC server listening on {}", grpc_addr_for_task);
-        let server = crate::upstream::GrpcServer::new(crate::upstream::CommandServer::new(), grpc_state);
+        let server = crate::upstream::GrpcServer::new(crate::upstream::CommandServer::new(kernel_for_grpc), grpc_state);
         server
             .serve(grpc_addr_for_task)
             .await
