@@ -32,8 +32,8 @@ impl CommandService for CommandServiceImpl {
         &self,
         _request: Request<proto::ListRoomsRequest>,
     ) -> Result<Response<proto::ListRoomsResponse>, Status> {
-        let list = self.inner.list_rooms().await;
-        Ok(Response::new(proto::ListRoomsResponse { room_ids: list }))
+        let entries = self.inner.list_rooms().await;
+        Ok(Response::new(proto::ListRoomsResponse { rooms: entries }))
     }
 
     async fn delete_room(

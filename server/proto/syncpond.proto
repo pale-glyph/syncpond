@@ -6,7 +6,7 @@ message NewRoomRequest { string name = 1; }
 message NewRoomResponse { uint64 room_id = 1; }
 
 message ListRoomsRequest {}
-message ListRoomsResponse { repeated uint64 room_ids = 1; }
+message ListRoomsResponse { repeated string rooms = 1; }
 
 message DeleteRoomRequest { uint64 room_id = 1; }
 message DeleteRoomResponse {}

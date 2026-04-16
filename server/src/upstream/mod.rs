@@ -36,9 +36,15 @@ impl CommandServer {
         }
     }
 
-    pub async fn list_rooms(&self) -> Vec<u64> {
+    pub async fn list_rooms(&self) -> Vec<String> {
         let app = self.kernel.state.read().await;
-        app.list_rooms()
+        let ids = app.list_rooms();
+        ids.into_iter()
+            .map(|id| {
+                let label = app.get_room_label(id).unwrap_or_default();
+                format!("{}:{}", id, label)
+            })
+            .collect()
     }
 
     pub async fn delete_room(&self, room_id: u64) -> Result<(), String> {
