@@ -13,6 +13,16 @@ use tokio::sync::RwLock;
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+/// Event produced when a room's data changes that should be broadcast to WS clients.
+#[derive(Debug, Clone)]
+pub struct RoomUpdate {
+    pub room_id: u64,
+    pub container: String,
+    pub key: String,
+    pub value: Option<serde_json::Value>,
+    pub room_counter: u64,
+}
+
 #[derive(Debug)]
 pub struct FragmentEntry {
     pub value: Value,

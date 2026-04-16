@@ -6,35 +6,30 @@
 //! - Command API key and JWT signing keys must be provisioned securely and rotated out of band.
 #![deny(missing_docs)]
 
-mod commands;
 mod rate_limiter;
 mod state;
-mod ws;
-mod auth;
+mod downstream;
 mod upstream;
 
-use crate::commands::process_command;
 use crate::rate_limiter::RateLimiter;
 use crate::state::{AppState, SharedState};
-use crate::ws::{WsHub, handle_ws_connection};
+use crate::downstream::ws::{WsHub, handle_ws_connection};
 use anyhow::{Context, Result};
 use include_dir::{Dir, include_dir};
 use serde::Deserialize;
-use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
-use subtle::ConstantTimeEq;
+use std::{fs, net::SocketAddr, path::Path, sync::Arc};
+ 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock},
-    time::timeout,
 };
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Debug, Deserialize)]
 struct SyncpondConfig {
     command_api_key: String,
     ws_addr: Option<String>,
-    command_addr: Option<String>,
     upstream_grpc_addr: Option<String>,
     health_addr: Option<String>,
     jwt_key: Option<String>,
@@ -43,17 +38,11 @@ struct SyncpondConfig {
     jwt_ttl_seconds: Option<u64>,
     require_tls: Option<bool>,
     health_bind_loopback_only: Option<bool>,
-    command_rate_limit: Option<usize>,
-    command_rate_window_secs: Option<u64>,
     ws_auth_rate_limit: Option<usize>,
     ws_auth_rate_window_secs: Option<u64>,
-    ws_update_rate_limit: Option<usize>,
-    ws_update_rate_window_secs: Option<u64>,
     ws_room_rate_limit: Option<usize>,
     ws_room_rate_window_secs: Option<u64>,
     ws_allowed_origins: Option<Vec<String>>,
-    command_auth_rate_limit: Option<usize>,
-    command_auth_rate_window_secs: Option<u64>,
     save_dir: Option<String>,
 }
 
@@ -99,35 +88,21 @@ async fn main() -> Result<()> {
 
     let ws_hub = Arc::new(Mutex::new(WsHub::new()));
     let ws_auth_rate_limiter = Arc::new(RateLimiter::new());
-    let ws_update_rate_limiter = Arc::new(RateLimiter::new());
     let ws_room_rate_limiter = Arc::new(RateLimiter::new());
-    let command_rate_limiter = Arc::new(RateLimiter::new());
-    let command_auth_rate_limiter = Arc::new(RateLimiter::new());
 
-    let ws_update_rate_limiter_for_cmd = ws_update_rate_limiter.clone();
     let ws_room_rate_limiter_for_ws = ws_room_rate_limiter.clone();
-    let ws_room_rate_limiter_for_cmd = ws_room_rate_limiter.clone();
 
-    let cmd_rate_limit = config.command_rate_limit.unwrap_or(DEFAULT_CMD_RATE_LIMIT);
-    let cmd_rate_window_secs = config
-        .command_rate_window_secs
-        .unwrap_or(DEFAULT_CMD_RATE_WINDOW_SECS);
+    
     let ws_auth_rate_limit = config
         .ws_auth_rate_limit
         .unwrap_or(DEFAULT_WS_AUTH_RATE_LIMIT);
     let ws_auth_rate_window_secs = config
         .ws_auth_rate_window_secs
         .unwrap_or(DEFAULT_WS_AUTH_RATE_WINDOW_SECS);
-    let ws_update_rate_limit = config
-        .ws_update_rate_limit
-        .unwrap_or(DEFAULT_WS_UPDATE_RATE_LIMIT);
-    let ws_update_rate_window_secs = config
-        .ws_update_rate_window_secs
-        .unwrap_or(DEFAULT_WS_UPDATE_RATE_WINDOW_SECS);
-    let ws_room_rate_limit = config
+    let _ws_room_rate_limit = config
         .ws_room_rate_limit
         .unwrap_or(DEFAULT_WS_ROOM_RATE_LIMIT);
-    let ws_room_rate_window_secs = config
+    let _ws_room_rate_window_secs = config
         .ws_room_rate_window_secs
         .unwrap_or(DEFAULT_WS_ROOM_RATE_WINDOW_SECS);
     let ws_allowed_origins = config.ws_allowed_origins.clone().unwrap_or_else(|| {
@@ -137,12 +112,7 @@ async fn main() -> Result<()> {
             .collect()
     });
 
-    let command_auth_rate_limit = config
-        .command_auth_rate_limit
-        .unwrap_or(DEFAULT_COMMAND_AUTH_RATE_LIMIT);
-    let command_auth_rate_window_secs = config
-        .command_auth_rate_window_secs
-        .unwrap_or(DEFAULT_COMMAND_AUTH_RATE_WINDOW_SECS);
+    
 
     if config.command_api_key.trim().is_empty() {
         anyhow::bail!("command_api_key must be configured and non-empty");
@@ -158,9 +128,6 @@ async fn main() -> Result<()> {
     let ws_addr = config
         .ws_addr
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let command_addr = config
-        .command_addr
-        .unwrap_or_else(|| "127.0.0.1:9090".to_string());
     let health_addr = config
         .health_addr
         .unwrap_or_else(|| "127.0.0.1:7070".to_string());
@@ -169,9 +136,6 @@ async fn main() -> Result<()> {
     let ws_addr: SocketAddr = ws_addr
         .parse()
         .with_context(|| format!("invalid ws_addr: {}", ws_addr))?;
-    let command_addr: SocketAddr = command_addr
-        .parse()
-        .with_context(|| format!("invalid command_addr: {}", command_addr))?;
     let health_addr: SocketAddr = health_addr
         .parse()
         .with_context(|| format!("invalid health_addr: {}", health_addr))?;
@@ -189,13 +153,8 @@ async fn main() -> Result<()> {
 
     let ws_state = shared_state.clone();
     let ws_hub_for_ws = ws_hub.clone();
-    let command_state = shared_state.clone();
-    let ws_hub_for_cmd = ws_hub.clone();
-    let command_rate_limiter_for_cmd = command_rate_limiter.clone();
-    let command_auth_rate_limiter_for_cmd = command_auth_rate_limiter.clone();
 
     let ws_addr_for_task = ws_addr.clone();
-    let command_addr_for_task = command_addr.clone();
 
     let ws_server = tokio::spawn(async move {
         let listener = TcpListener::bind(ws_addr_for_task)
@@ -236,52 +195,7 @@ async fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    let command_server = tokio::spawn(async move {
-        let listener = TcpListener::bind(command_addr_for_task)
-            .await
-            .context("cmd bind failed")?;
-        info!(
-            "syncpond command socket listening on {}",
-            command_addr_for_task
-        );
-
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            let state = command_state.clone();
-            let hub = ws_hub_for_cmd.clone();
-            let rate_limiter = command_rate_limiter_for_cmd.clone();
-            let ws_update_rate_limiter = ws_update_rate_limiter_for_cmd.clone();
-            let ws_room_rate_limiter = ws_room_rate_limiter_for_cmd.clone();
-            let command_auth_rate_limiter_for_conn = command_auth_rate_limiter_for_cmd.clone();
-            tokio::spawn(async move {
-                if let Err(err) = handle_command_connection(
-                    stream,
-                    peer,
-                    state,
-                    hub,
-                    rate_limiter,
-                    command_auth_rate_limiter_for_conn,
-                    ws_update_rate_limiter,
-                    ws_room_rate_limiter,
-                    ws_update_rate_limit,
-                    ws_update_rate_window_secs,
-                    ws_room_rate_limit,
-                    ws_room_rate_window_secs,
-                    cmd_rate_limit,
-                    cmd_rate_window_secs,
-                    command_auth_rate_limit,
-                    command_auth_rate_window_secs,
-                )
-                .await
-                {
-                    error!(%err, peer = %peer, "command connection error");
-                }
-            });
-        }
-
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    });
+    // legacy TCP command server removed; use upstream gRPC for trusted application servers
 
     let health_state = shared_state.clone();
     let health_addr_for_task = health_addr.clone();
@@ -339,7 +253,6 @@ async fn main() -> Result<()> {
     tokio::select! {
         res = shutdown => res?,
         res = ws_server => res??,
-        res = command_server => res??,
         res = health_server => res??,
         res = grpc_server => res??,
     }
@@ -350,21 +263,13 @@ async fn main() -> Result<()> {
 
 const MAX_COMMAND_LINE_LEN: usize = 8192;
 
-const DEFAULT_CMD_RATE_LIMIT: usize = 120;
-const DEFAULT_CMD_RATE_WINDOW_SECS: u64 = 60;
 const DEFAULT_WS_AUTH_RATE_LIMIT: usize = 10;
 const DEFAULT_WS_AUTH_RATE_WINDOW_SECS: u64 = 60;
-const DEFAULT_WS_UPDATE_RATE_LIMIT: usize = 240;
-const DEFAULT_WS_UPDATE_RATE_WINDOW_SECS: u64 = 60;
 const DEFAULT_WS_ROOM_RATE_LIMIT: usize = 1000;
 const DEFAULT_WS_ROOM_RATE_WINDOW_SECS: u64 = 60;
 const DEFAULT_WS_ALLOWED_ORIGINS: &[&str] = &[];
-const DEFAULT_COMMAND_AUTH_RATE_LIMIT: usize = 5;
-const DEFAULT_COMMAND_AUTH_RATE_WINDOW_SECS: u64 = 60;
 
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.as_bytes().ct_eq(b.as_bytes()).into()
-}
+// legacy command helpers removed; no constant-time compare helper needed here
 
 async fn read_line_with_limit<R>(reader: &mut BufReader<R>, line: &mut String) -> Result<usize>
 where
@@ -572,198 +477,4 @@ async fn handle_ws_or_docs_connection(
     )
     .await
 }
-
-async fn handle_command_connection(
-    stream: TcpStream,
-    peer: SocketAddr,
-    state: SharedState,
-    ws_hub: Arc<Mutex<WsHub>>,
-    rate_limiter: Arc<RateLimiter>,
-    command_auth_rate_limiter: Arc<RateLimiter>,
-    ws_update_rate_limiter: Arc<RateLimiter>,
-    ws_room_rate_limiter: Arc<RateLimiter>,
-    ws_update_rate_limit: usize,
-    ws_update_rate_window_secs: u64,
-    ws_room_rate_limit: usize,
-    ws_room_rate_window_secs: u64,
-    cmd_rate_limit: usize,
-    cmd_rate_window_secs: u64,
-    command_auth_rate_limit: usize,
-    command_auth_rate_window_secs: u64,
-) -> Result<()> {
-    let key = peer.ip().to_string();
-    let allowed = rate_limiter
-        .allow(
-            &key,
-            cmd_rate_limit,
-            Duration::from_secs(cmd_rate_window_secs),
-        )
-        .await;
-    if !allowed {
-        warn!(%peer, "command rate limit exceeded");
-        return Ok(());
-    }
-
-    let auth_allowed = command_auth_rate_limiter
-        .allow(
-            &key,
-            command_auth_rate_limit,
-            Duration::from_secs(command_auth_rate_window_secs),
-        )
-        .await;
-    if !auth_allowed {
-        warn!(%peer, "command auth rate limit exceeded");
-        return Ok(());
-    }
-
-    info!(%peer, "command connection established");
-
-    let (reader, writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
-    let mut line = String::new();
-
-    // first message must be API key; enforce 30 s idle timeout so a
-    // connection that never sends cannot hold a fd open forever.
-    line.clear();
-    let first_bytes = match timeout(
-        Duration::from_secs(30),
-        read_line_with_limit(&mut reader, &mut line),
-    )
-    .await
-    {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return Err(e),
-        Err(_elapsed) => {
-            warn!(%peer, "command connection idle timeout before auth");
-            return Ok(());
-        }
-    };
-    if first_bytes == 0 {
-        return Ok(());
-    }
-    let provided_key = line.trim();
-
-    let expected_key = {
-        let app = state.read().await;
-        app.command_api_key.clone()
-    };
-
-    if let Some(expected_key) = expected_key {
-        if !constant_time_eq(provided_key, &expected_key) {
-            {
-                let mut app = state.write().await;
-                app.command_auth_failure = app.command_auth_failure.saturating_add(1);
-            }
-            warn!(%peer, "command API key rejected: invalid_api_key");
-            writer.write_all(b"ERROR invalid_api_key\n").await?;
-            writer.flush().await?;
-            return Ok(());
-        }
-    } else {
-        {
-            let mut app = state.write().await;
-            app.command_auth_failure = app.command_auth_failure.saturating_add(1);
-        }
-        warn!(%peer, "command API key rejected: api_key_not_configured");
-        writer.write_all(b"ERROR api_key_not_configured\n").await?;
-        writer.flush().await?;
-        return Ok(());
-    }
-
-    loop {
-        line.clear();
-        let bytes = match read_line_with_limit(&mut reader, &mut line).await {
-            Ok(n) => n,
-            Err(_) => {
-                let msg = "ERROR malformed_request\n";
-                writer.write_all(msg.as_bytes()).await?;
-                writer.flush().await?;
-                let mut app = state.write().await;
-                app.invalid_command_count = app.invalid_command_count.saturating_add(1);
-                return Ok(());
-            }
-        };
-        if bytes == 0 {
-            break;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        {
-            let mut app = state.write().await;
-            app.total_command_requests = app.total_command_requests.saturating_add(1);
-        }
-
-        let (resp, updates) = process_command(trimmed, &state).await;
-
-        if resp.starts_with("ERROR") {
-            let mut app = state.write().await;
-            app.command_error_count = app.command_error_count.saturating_add(1);
-            if resp.starts_with("ERROR invalid_")
-                || resp == "ERROR unknown_command"
-                || resp == "ERROR missing_argument"
-            {
-                app.invalid_command_count = app.invalid_command_count.saturating_add(1);
-            }
-        }
-        writer.write_all(resp.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-
-        let mut room_deleted: Option<u64> = None;
-        if trimmed.starts_with("ROOM.DELETE") {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(id) = parts[1].parse::<u64>() {
-                    if resp == "OK" {
-                        room_deleted = Some(id);
-                    }
-                }
-            }
-        }
-
-        if let Some(room_id) = room_deleted {
-            let mut hub = ws_hub.lock().await;
-            hub.remove_room(room_id);
-            info!(room_id, "ws hub cleanup on room delete");
-        }
-
-        if !updates.is_empty() {
-            for update in updates {
-                let room_key = format!("room:{}", update.room_id);
-                let room_allowed = ws_room_rate_limiter
-                    .allow(
-                        &room_key,
-                        ws_room_rate_limit,
-                        std::time::Duration::from_secs(ws_room_rate_window_secs),
-                    )
-                    .await;
-
-                if !room_allowed {
-                    info!(
-                        room_id = update.room_id,
-                        "room-level ws update rate limit exceeded"
-                    );
-                    continue;
-                }
-
-                let mut hub = ws_hub.lock().await;
-                hub.broadcast_update(
-                    update,
-                    &ws_update_rate_limiter,
-                    ws_update_rate_limit,
-                    ws_update_rate_window_secs,
-                    &state,
-                )
-                .await;
-            }
-        }
-    }
-
-    info!(%peer, "command disconnected");
-    Ok(())
-}
+// legacy TCP command connection function removed; use upstream gRPC for trusted application servers
