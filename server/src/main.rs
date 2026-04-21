@@ -14,32 +14,27 @@ mod rate_limiter;
 mod state;
 mod upstream;
 
-use crate::downstream::hub::ClientMessage;
-use crate::downstream::hub::{DataUpdate, WsHub};
+use crate::downstream::hub::{ClientMessage, UpdateChannelMessage};
+use crate::downstream::hub::WsHub;
 use crate::kernel::KernelSignal;
-use crate::rate_limiter::RateLimiter;
-use crate::state::{AppState, SharedState};
+use crate::state::AppState;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{fs, net::SocketAddr, path::Path, sync::Arc};
+use std::{fs, net::SocketAddr, sync::Arc};
 
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info};
+use tracing::info;
 
 #[derive(Debug, Deserialize)]
 struct SyncpondConfig {
     command_api_key: String,
     ws_addr: Option<String>,
     upstream_grpc_addr: Option<String>,
-    health_addr: Option<String>,
     jwt_key: Option<String>,
     jwt_issuer: Option<String>,
     jwt_audience: Option<String>,
     jwt_ttl_seconds: Option<u64>,
     require_tls: Option<bool>,
-    health_bind_loopback_only: Option<bool>,
-    ws_auth_rate_limit: Option<usize>,
-    ws_auth_rate_window_secs: Option<u64>,
     ws_room_rate_limit: Option<usize>,
     ws_room_rate_window_secs: Option<u64>,
     ws_allowed_origins: Option<Vec<String>>,
@@ -137,8 +132,8 @@ async fn main() -> Result<()> {
     let shared_state = Arc::new(RwLock::new(base_state));
 
     // Channels for notification, commands (from WS clients -> kernel), and signals (to kernel).
-    let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<DataUpdate>(1024);
-    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<ClientMessage>(1024);
+    let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<UpdateChannelMessage>(1024);
+    let (command_tx, _command_rx) = tokio::sync::mpsc::channel::<ClientMessage>(1024);
     let (signal_tx, signal_rx) = tokio::sync::mpsc::channel::<KernelSignal>(1024);
 
     // Inject senders into WsHub so external components can use them.
@@ -147,17 +142,7 @@ async fn main() -> Result<()> {
         command_tx.clone(),
         signal_tx.clone(),
     )));
-    let ws_auth_rate_limiter = Arc::new(RateLimiter::new());
-    let ws_room_rate_limiter = Arc::new(RateLimiter::new());
 
-    let ws_room_rate_limiter_for_ws = ws_room_rate_limiter.clone();
-
-    let ws_auth_rate_limit = config
-        .ws_auth_rate_limit
-        .unwrap_or(DEFAULT_WS_AUTH_RATE_LIMIT);
-    let ws_auth_rate_window_secs = config
-        .ws_auth_rate_window_secs
-        .unwrap_or(DEFAULT_WS_AUTH_RATE_WINDOW_SECS);
     let ws_room_rate_limit = config
         .ws_room_rate_limit
         .unwrap_or(DEFAULT_WS_ROOM_RATE_LIMIT);
@@ -187,17 +172,10 @@ async fn main() -> Result<()> {
     let ws_addr = config
         .ws_addr
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let health_addr = config
-        .health_addr
-        .unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let health_bind_loopback_only = config.health_bind_loopback_only.unwrap_or(true);
 
     let ws_addr: SocketAddr = ws_addr
         .parse()
         .with_context(|| format!("invalid ws_addr: {}", ws_addr))?;
-    let health_addr: SocketAddr = health_addr
-        .parse()
-        .with_context(|| format!("invalid health_addr: {}", health_addr))?;
 
     let grpc_addr = config
         .upstream_grpc_addr
@@ -206,45 +184,30 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("invalid upstream_grpc_addr: {}", grpc_addr))?;
 
-    if health_bind_loopback_only && !health_addr.ip().is_loopback() {
-        anyhow::bail!("health_bind_loopback_only=true but health_addr is not loopback");
-    }
-
     // Spawn the websocket server; pass JWT config so downstream doesn't need SharedState.
     let ws_server = crate::downstream::server::spawn_ws_server(
         ws_addr,
         ws_hub.clone(),
-        ws_auth_rate_limiter.clone(),
-        ws_room_rate_limiter_for_ws.clone(),
-        ws_auth_rate_limit,
-        ws_auth_rate_window_secs,
+        ws_room_rate_limit,
+        ws_room_rate_window_secs,
         ws_allowed_origins.clone(),
         config.jwt_key.clone(),
         config.jwt_issuer.clone(),
         config.jwt_audience.clone(),
     );
 
-    // Start the downstream forwarder and health server (health no longer uses AppState).
-    let (forwarder, health_server) = crate::downstream::server::start_downstream(
-        health_addr,
-        ws_hub.clone(),
-        health_bind_loopback_only,
-    )
-    .await?;
+    // Start the downstream forwarder (no docs/health HTTP server).
+    let forwarder = crate::downstream::server::start_downstream(ws_hub.clone()).await?;
 
     // build the Kernel which coordinates state and downstream components
     let kernel = Arc::new(crate::kernel::SyncpondKernel::new(
         shared_state.clone(),
         ws_hub.clone(),
-        ws_room_rate_limiter.clone(),
-        ws_room_rate_limit,
-        ws_room_rate_window_secs,
         persistence.clone(),
         notification_tx.clone(),
     ));
 
-    // Start kernel background processors to handle commands and signals from WS.
-    let kernel_for_cmds = kernel.clone();
+    // Start kernel background processors to handle signals from WS.
     let kernel_for_signals = kernel.clone();
     kernel_for_signals.start_signal_processor(signal_rx);
 
@@ -282,7 +245,6 @@ async fn main() -> Result<()> {
         res = shutdown => res?,
         res = forwarder => res??,
         res = ws_server => res??,
-        res = health_server => res??,
         res = grpc_server => res??,
     }
 
@@ -290,10 +252,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-const MAX_COMMAND_LINE_LEN: usize = 8192;
-
-const DEFAULT_WS_AUTH_RATE_LIMIT: usize = 10;
-const DEFAULT_WS_AUTH_RATE_WINDOW_SECS: u64 = 60;
 const DEFAULT_WS_ROOM_RATE_LIMIT: usize = 1000;
 const DEFAULT_WS_ROOM_RATE_WINDOW_SECS: u64 = 60;
 const DEFAULT_WS_ALLOWED_ORIGINS: &[&str] = &[];

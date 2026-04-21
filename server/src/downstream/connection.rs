@@ -46,7 +46,7 @@ pub async fn handle_ws_connection(
         return Ok(());
     }
 
-    let connection_start = Instant::now();
+    let _connection_start = Instant::now();
     let ws_stream = if !ws_allowed_origins.is_empty() {
         let origins = ws_allowed_origins.clone();
         tokio_tungstenite::accept_hdr_async(stream, move |req: &Request, response: Response| {

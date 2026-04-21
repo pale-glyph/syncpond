@@ -1,12 +1,14 @@
-use crate::command::{Commands, CommandResponse};
-use crate::state::SharedState;
-use crate::downstream::hub::DataUpdate;
-use crate::persistance::PersistenceManager;
+use crate::command::{CommandResponse, Commands};
 use crate::downstream::hub::WsHub;
-use crate::rate_limiter::RateLimiter;
+use crate::downstream::hub::{DataUpdate, UpdateChannelMessage};
+use crate::persistance::PersistenceManager;
+use crate::state::SharedState;
 use serde_json::Value;
-use std::{collections::{HashMap, HashSet}, sync::Arc};
-use tokio::sync::{Mutex, mpsc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+use tokio::sync::{mpsc, Mutex};
 // connection ids are numeric u64 allocated by WsHub
 use tracing::{debug, error, info};
 
@@ -15,8 +17,14 @@ use tracing::{debug, error, info};
 pub enum KernelSignal {
     Shutdown,
     Custom(String),
-    ClientConnected { conn_id: u64, room_id: u64, allowed_buckets: HashSet<u64> },
-    ClientDisconnected { conn_id: u64 },
+    ClientConnected {
+        conn_id: u64,
+        room_id: u64,
+        allowed_buckets: HashSet<u64>,
+    },
+    ClientDisconnected {
+        conn_id: u64,
+    },
 }
 
 impl KernelSignal {
@@ -30,30 +38,21 @@ impl KernelSignal {
 /// gRPC server can call into.
 pub struct SyncpondKernel {
     pub state: SharedState,
-    pub ws_hub: Arc<Mutex<WsHub>>,
-    pub ws_update_rate_limiter: Arc<RateLimiter>,
-    pub ws_update_rate_limit: usize,
-    pub ws_update_rate_window_secs: u64,
+    pub _ws_hub: Arc<Mutex<WsHub>>,
     pub persistence: Arc<PersistenceManager>,
-    pub notification_sender: mpsc::Sender<DataUpdate>,
+    pub notification_sender: mpsc::Sender<UpdateChannelMessage>,
 }
 
 impl SyncpondKernel {
     pub fn new(
         state: SharedState,
         ws_hub: Arc<Mutex<WsHub>>,
-        ws_update_rate_limiter: Arc<RateLimiter>,
-        ws_update_rate_limit: usize,
-        ws_update_rate_window_secs: u64,
         persistence: Arc<PersistenceManager>,
-        notification_sender: mpsc::Sender<DataUpdate>,
+        notification_sender: mpsc::Sender<UpdateChannelMessage>,
     ) -> Self {
         Self {
             state,
-            ws_hub,
-            ws_update_rate_limiter,
-            ws_update_rate_limit,
-            ws_update_rate_window_secs,
+            _ws_hub: ws_hub,
             persistence,
             notification_sender,
         }
@@ -84,8 +83,17 @@ impl SyncpondKernel {
                     KernelSignal::Custom(s) => {
                         info!(signal = %s, "kernel received custom signal");
                     }
-                    KernelSignal::ClientConnected { conn_id, room_id, allowed_buckets } => {
-                        info!(conn = conn_id, room = room_id, allowed_buckets = allowed_buckets.len(), "client connected");
+                    KernelSignal::ClientConnected {
+                        conn_id,
+                        room_id,
+                        allowed_buckets,
+                    } => {
+                        info!(
+                            conn = conn_id,
+                            room = room_id,
+                            allowed_buckets = allowed_buckets.len(),
+                            "client connected"
+                        );
                     }
                     KernelSignal::ClientDisconnected { conn_id } => {
                         info!(conn = conn_id, "client disconnected");
@@ -143,7 +151,7 @@ impl SyncpondKernel {
             }
             Commands::CreateBucket(room_id, bucket_id, label) => {
                 // Create a named container for the given bucket id and set optional label.
-                let mut app = self.state.write().await;
+                let app = self.state.write().await;
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     let label_trimmed = label.trim().to_string();
                     if let Ok(mut room) = room_arc.write() {
@@ -155,7 +163,11 @@ impl SyncpondKernel {
                         }
                     }
                     // persist bucket record (id, optional label, flags) into the room DB (best-effort)
-                    let label_opt = if label_trimmed.is_empty() { None } else { Some(label_trimmed.as_str()) };
+                    let label_opt = if label_trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(label_trimmed.as_str())
+                    };
                     let _ = self.persistence.open_room_db(room_id);
                     if let Some(rp) = self.persistence.room(room_id) {
                         if let Err(e) = rp.persist_bucket(bucket_id, label_opt, 0u32) {
@@ -166,7 +178,7 @@ impl SyncpondKernel {
                 CommandResponse::CreateBucketResponse
             }
             Commands::DeleteBucket(room_id, bucket_id) => {
-                let mut app = self.state.write().await;
+                let app = self.state.write().await;
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     if let Ok(mut room) = room_arc.write() {
                         room.buckets.remove(&bucket_id);
@@ -194,24 +206,28 @@ impl SyncpondKernel {
 
                 // apply state mutation
                 {
-                    let mut app = self.state.write().await;
+                    let app = self.state.write().await;
                     if let Err(err) = app.set_fragment(room_id, 0, key.clone(), parsed.clone()) {
                         error!(room = room_id, "set_fragment error: {:?}", err);
                     }
                 }
 
                 // persist fragment via persistence manager (best-effort)
-                    {
-                        let fragment_val_opt: Option<&Value> = if parsed.is_null() { None } else { Some(&parsed) };
-                        let _ = self.persistence.open_room_db(room_id);
-                        if let Some(rp) = self.persistence.room(room_id) {
-                            if let Err(e) = rp.persist_fragment("public", &key, fragment_val_opt) {
-                                error!(%e, room = room_id, key = %key, "persistence persist_fragment failed");
-                            }
-                        } else {
-                            error!(room = room_id, "no persistence available for room");
+                {
+                    let fragment_val_opt: Option<&Value> = if parsed.is_null() {
+                        None
+                    } else {
+                        Some(&parsed)
+                    };
+                    let _ = self.persistence.open_room_db(room_id);
+                    if let Some(rp) = self.persistence.room(room_id) {
+                        if let Err(e) = rp.persist_fragment("public", &key, fragment_val_opt) {
+                            error!(%e, room = room_id, key = %key, "persistence persist_fragment failed");
                         }
+                    } else {
+                        error!(room = room_id, "no persistence available for room");
                     }
+                }
 
                 // broadcast update to WS clients
                 let room_counter = {
@@ -226,7 +242,10 @@ impl SyncpondKernel {
                     bucket_counter: room_counter,
                 };
 
-                if let Err(err) = self.notification_sender.try_send(update) {
+                if let Err(err) = self
+                    .notification_sender
+                    .try_send(UpdateChannelMessage::Broadcast(update))
+                {
                     error!(room = room_id, %err, "notification channel send failed, dropping update");
                 }
 
