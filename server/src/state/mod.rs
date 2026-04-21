@@ -619,7 +619,8 @@ impl AppState {
     pub fn create_room_token(
         &mut self,
         room_id: u64,
-        containers: &[String],
+        sub: &str,
+        buckets: &[u64],
     ) -> Result<String, StateError> {
         let key = self
             .jwt_key
@@ -641,15 +642,15 @@ impl AppState {
         if !self.rooms.contains_key(&room_id) {
             return Err(StateError::RoomNotFound);
         }
-        // Reject attempts to include reserved server-only container in JWT grants.
-        for c in containers.iter() {
-            if c == "server_only" {
+        // Reject attempts to include reserved server-only bucket in JWT grants.
+        for id in buckets.iter() {
+            if *id == SERVER_ONLY_BUCKET_ID {
                 return Err(StateError::ReservedBucketId);
             }
         }
 
-        let mut container_set: HashSet<String> = containers.iter().cloned().collect();
-        container_set.insert("public".to_string());
+        let mut bucket_set: HashSet<u64> = buckets.iter().copied().collect();
+        bucket_set.insert(0u64);
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -668,17 +669,15 @@ impl AppState {
         #[derive(Debug, Serialize, Deserialize)]
         struct JwtClaims {
             sub: String,
-            room: String,
-            containers: Vec<String>,
+            buckets: Vec<u64>,
             exp: usize,
             iss: Option<String>,
             aud: Option<String>,
         }
 
         let claims = JwtClaims {
-            sub: format!("room:{}", room_id),
-            room: room_id.to_string(),
-            containers: container_set.into_iter().collect(),
+            sub: sub.to_string(),
+            buckets: bucket_set.into_iter().collect(),
             exp: exp as usize,
             iss: self.jwt_issuer.clone(),
             aud: self.jwt_audience.clone(),
@@ -935,7 +934,7 @@ mod tests {
 
         let room_id = app.create_room();
         let err = app
-            .create_room_token(room_id, &["public".to_string()])
+            .create_room_token(room_id, "room:1", &[0u64])
             .unwrap_err();
         assert!(matches!(err, StateError::JwtKeyTooShort));
     }
@@ -1153,7 +1152,7 @@ mod tests {
         app.set_jwt_issuer("iss".to_string());
         app.set_jwt_audience("aud".to_string());
         let room_id = app.create_room();
-        let err = app.create_room_token(room_id, &[]).unwrap_err();
+        let err = app.create_room_token(room_id, "room:1", &[]).unwrap_err();
         assert!(matches!(err, StateError::JwtKeyNotConfigured));
     }
 
@@ -1162,7 +1161,7 @@ mod tests {
         let mut app = AppState::new();
         app.set_jwt_key("a".repeat(32));
         let room_id = app.create_room();
-        let err = app.create_room_token(room_id, &[]).unwrap_err();
+        let err = app.create_room_token(room_id, "room:1", &[]).unwrap_err();
         assert!(matches!(err, StateError::JwtIssuerAudienceNotConfigured));
     }
 
@@ -1172,7 +1171,7 @@ mod tests {
         app.set_jwt_key("a".repeat(32));
         app.set_jwt_issuer("iss".to_string());
         app.set_jwt_audience("aud".to_string());
-        let err = app.create_room_token(999, &[]).unwrap_err();
+        let err = app.create_room_token(999, "room:1", &[]).unwrap_err();
         assert!(matches!(err, StateError::RoomNotFound));
     }
 
@@ -1185,7 +1184,7 @@ mod tests {
         let room_id = app.create_room();
 
         let token = app
-            .create_room_token(room_id, &["priv".to_string()])
+            .create_room_token(room_id, "room:1", &[1u64])
             .unwrap();
         // JWT format: three base64url parts separated by '.'
         let parts: Vec<&str> = token.split('.').collect();
@@ -1201,8 +1200,8 @@ mod tests {
         app.set_jwt_audience("client".to_string());
         let room_id = app.create_room();
 
-        let t1 = app.create_room_token(room_id, &[]).unwrap();
-        let t2 = app.create_room_token(room_id, &[]).unwrap();
+        let t1 = app.create_room_token(room_id, "room:1", &[]).unwrap();
+        let t2 = app.create_room_token(room_id, "room:1", &[]).unwrap();
         // Tokens may differ because the monotone clock bumps exp/iat
         assert_ne!(t1, t2, "successive tokens should differ in timestamp");
     }

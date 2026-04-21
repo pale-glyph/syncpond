@@ -1,15 +1,10 @@
-use crate::downstream::auth::{AuthMessage, validate_jwt_claims};
+use crate::downstream::auth::{validate_jwt_claims, AuthMessage};
 use crate::downstream::hub::{WsHub, MAX_WS_PENDING_MESSAGES};
-use crate::rate_limiter::RateLimiter;
+use crate::kernel::KernelSignal;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::{
-    collections::HashSet,
-    net::SocketAddr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{
     net::TcpStream,
     sync::{mpsc, Mutex},
@@ -24,28 +19,12 @@ pub async fn handle_ws_connection(
     stream: TcpStream,
     peer: SocketAddr,
     ws_hub: Arc<Mutex<WsHub>>,
-    auth_rate_limiter: Arc<RateLimiter>,
-    _ws_room_rate_limiter: Arc<RateLimiter>,
-    ws_auth_rate_limit: usize,
-    ws_auth_rate_window_secs: u64,
+    signal_sender: mpsc::Sender<KernelSignal>,
     ws_allowed_origins: Vec<String>,
     jwt_key: Option<String>,
     jwt_issuer: Option<String>,
     jwt_audience: Option<String>,
 ) -> Result<()> {
-    let key = peer.ip().to_string();
-    let allowed = auth_rate_limiter
-        .allow(
-            &key,
-            ws_auth_rate_limit,
-            Duration::from_secs(ws_auth_rate_window_secs),
-        )
-        .await;
-    if !allowed {
-        warn!(%peer, "ws auth rate limit exceeded");
-        return Ok(());
-    }
-
     let _connection_start = Instant::now();
     let ws_stream = if !ws_allowed_origins.is_empty() {
         let origins = ws_allowed_origins.clone();
@@ -124,7 +103,7 @@ pub async fn handle_ws_connection(
         &auth_msg.jwt,
     ) {
         Ok(claims) => {
-            info!(%peer, room = %claims.room, "ws auth success");
+            info!(%peer, sub = %claims.sub, "ws auth success");
             claims
         }
         Err(reason) => {
@@ -134,43 +113,13 @@ pub async fn handle_ws_connection(
             return Ok(());
         }
     };
-    let room_id: u64 = match claims.room.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            let err = json!({"type":"auth_error","reason":"invalid_room_claim"});
-            ws_sender.send(Message::Text(err.to_string())).await.ok();
-            return Ok(());
-        }
-    };
+    let room_id: u64 = 0;
 
     let _last_seen_counter = auth_msg.last_seen_counter;
 
-    let mut allowed_containers: HashSet<String> =
-        claims.containers.unwrap_or_default().into_iter().collect();
-    allowed_containers.insert("public".to_string());
-    // Ensure reserved container isn't accidentally granted to the WS client's allowed set.
-    allowed_containers.remove("server_only");
-
-    // Map allowed container names to numeric bucket ids. Try parsing
-    // "bucket_<id>", allow "public" -> 0, and fall back to label
-    // lookup in room.bucket_labels.
-    let mut allowed_buckets: HashSet<u64> = HashSet::new();
-    for c in allowed_containers.iter() {
-        if c == "public" {
-            allowed_buckets.insert(0);
-            continue;
-        }
-        if let Some(s) = c.strip_prefix("bucket_") {
-            if let Ok(id) = s.parse::<u64>() {
-                allowed_buckets.insert(id);
-                continue;
-            }
-        }
-        // No SharedState access here: ignore human-friendly labels for now.
-    }
-
-    // ensure public bucket is included
+    let mut allowed_buckets: HashSet<u64> = claims.buckets.unwrap_or_default().into_iter().collect();
     allowed_buckets.insert(0);
+    allowed_buckets.remove(&crate::state::SERVER_ONLY_BUCKET_ID);
 
     // No initial snapshot from SharedState here. Kernel will send updates.
     let bucket_count = 0usize;
@@ -188,23 +137,28 @@ pub async fn handle_ws_connection(
 
     let (tx, mut rx) = mpsc::channel::<Value>(MAX_WS_PENDING_MESSAGES);
 
-    let add_res = {
+    let conn_id = {
         let mut hub = ws_hub.lock().await;
         let conn_id = hub.allocate_connection_id();
         match hub.add_client(conn_id, room_id, allowed_buckets.clone(), tx.clone()) {
-            Ok(()) => Ok(conn_id),
-            Err(e) => Err(e),
+            Ok(()) => conn_id,
+            Err(reason) => {
+                let err = json!({"type":"auth_error","reason":reason});
+                ws_sender.send(Message::Text(err.to_string())).await.ok();
+                return Ok(());
+            }
         }
     };
-    if let Err(reason) = add_res {
-        let err = json!({"type":"auth_error","reason":reason});
-        ws_sender.send(Message::Text(err.to_string())).await.ok();
-        return Ok(());
-    }
-    // add_res is Ok(conn_id)
-    let conn_id = add_res.unwrap();
-    info!(%peer, room_id = room_id, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client added");
 
+    signal_sender
+        .try_send(KernelSignal::ClientConnected {
+            conn_id,
+            room_id,
+            requested_buckets: allowed_buckets.iter().cloned().collect(),
+        })
+        .ok();
+
+    info!(%peer, room_id = room_id, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client added");
     info!(%peer, room_id = room_id, "ws client authenticated and added");
 
     loop {
@@ -267,6 +221,10 @@ pub async fn handle_ws_connection(
         let mut hub = ws_hub.lock().await;
         hub.remove_client(conn_id);
     }
+
+    signal_sender
+        .try_send(KernelSignal::ClientDisconnected { conn_id })
+        .ok();
 
     info!(%peer, "ws client disconnected");
 

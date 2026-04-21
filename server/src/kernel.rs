@@ -20,7 +20,7 @@ pub enum KernelSignal {
     ClientConnected {
         conn_id: u64,
         room_id: u64,
-        allowed_buckets: HashSet<u64>,
+        requested_buckets: Vec<u64>,
     },
     ClientDisconnected {
         conn_id: u64,
@@ -86,14 +86,16 @@ impl SyncpondKernel {
                     KernelSignal::ClientConnected {
                         conn_id,
                         room_id,
-                        allowed_buckets,
+                        requested_buckets,
                     } => {
+                        let bucket_count = requested_buckets.len();
                         info!(
                             conn = conn_id,
                             room = room_id,
-                            allowed_buckets = allowed_buckets.len(),
+                            requested_buckets = bucket_count,
                             "client connected"
                         );
+                        self.send_initial_room_notifications(conn_id, room_id, requested_buckets).await;
                     }
                     KernelSignal::ClientDisconnected { conn_id } => {
                         info!(conn = conn_id, "client disconnected");
@@ -101,6 +103,56 @@ impl SyncpondKernel {
                 }
             }
         });
+    }
+
+    async fn send_initial_room_notifications(
+        &self,
+        conn_id: u64,
+        room_id: u64,
+        requested_rooms: Vec<u64>,
+    ) {
+        let allowed_buckets: HashSet<u64> = requested_rooms.into_iter().collect();
+        let snapshot_opt = {
+            let app = self.state.read().await;
+            app.room_snapshot(room_id, &allowed_buckets)
+        };
+
+        if let Some(snapshot) = snapshot_opt {
+            let room_counter = snapshot
+                .get("room_counter")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default();
+
+            if let Some(buckets) = snapshot.get("buckets").and_then(|v| v.as_object()) {
+                for (bucket_name, bucket_values) in buckets {
+                    if let Some(bucket_id) = bucket_name
+                        .strip_prefix("bucket_")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        if let Some(bucket_map) = bucket_values.as_object() {
+                            for (key, value) in bucket_map {
+                                let update = DataUpdate {
+                                    bucket_id,
+                                    key: key.clone(),
+                                    value: Some(value.clone()),
+                                    bucket_counter: room_counter,
+                                };
+                                if let Err(err) = self
+                                    .notification_sender
+                                    .send(UpdateChannelMessage::Targeted {
+                                        conn_id,
+                                        msg: update,
+                                    })
+                                    .await
+                                {
+                                    error!(conn = conn_id, %err, "failed to send initial room notification");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Execute a command against the kernel/state and return a response.

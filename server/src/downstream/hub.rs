@@ -1,11 +1,11 @@
-use crate::kernel::KernelSignal;
+use crate::command::Commands;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc;
-use tracing::error;
+use std::{collections::{HashMap, HashSet}, sync::Arc};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{error, warn};
 // connection IDs are numeric (auto-incrementing u64) managed by the hub
 
-pub const MAX_WS_CLIENTS_PER_ROOM: usize = 200;
+pub const MAX_WS_CLIENTS_PER_BUCKET: usize = 200;
 pub const MAX_WS_PENDING_MESSAGES: usize = 256;
 
 /// Data update event for downstream/hub internal use. This mirrors the
@@ -24,13 +24,10 @@ pub enum UpdateChannelMessage {
     Targeted { conn_id: u64, msg: DataUpdate },
 }
 
-pub struct ClientMessage {
-    pub conn_id: u64,
-    pub msg: Value,
-}
-
 /// Per-client subscription and outbound channel info.
 pub struct ClientInfo {
+    /// Room id associated with this connection.
+    pub room_id: u64,
     /// Buckets the client has authorization for (numeric bucket ids).
     pub buckets: HashSet<u64>,
     /// Sender for room update events.
@@ -53,15 +50,13 @@ pub struct WsHub {
 
     // Channels
     notification_receiver: Option<mpsc::Receiver<UpdateChannelMessage>>,
-    command_sender: mpsc::Sender<ClientMessage>,
-    signal_sender: mpsc::Sender<KernelSignal>,
+    command_sender: mpsc::Sender<Commands>,
 }
 
 impl WsHub {
     pub fn new(
         notification_receiver: mpsc::Receiver<UpdateChannelMessage>,
-        command_sender: mpsc::Sender<ClientMessage>,
-        signal_sender: mpsc::Sender<KernelSignal>,
+        command_sender: mpsc::Sender<Commands>,
     ) -> Self {
         Self {
             next_conn_id: 1,
@@ -69,7 +64,6 @@ impl WsHub {
             buckets: HashMap::new(),
             notification_receiver: Some(notification_receiver),
             command_sender,
-            signal_sender,
         }
     }
 
@@ -87,7 +81,7 @@ impl WsHub {
         id
     }
 
-    /// Add a client to the room hub if room size limits allow.
+    /// Add a client to the bucket hub if bucket size limits allow.
     pub fn add_client(
         &mut self,
         conn_id: u64,
@@ -98,7 +92,7 @@ impl WsHub {
         // Enforce per-bucket client limits.
         for bucket in allowed_buckets.iter() {
             if let Some(conn_set) = self.buckets.get(bucket) {
-                if conn_set.len() >= MAX_WS_CLIENTS_PER_ROOM && !conn_set.contains(&conn_id) {
+                if conn_set.len() >= MAX_WS_CLIENTS_PER_BUCKET && !conn_set.contains(&conn_id) {
                     return Err("bucket_client_limit_exceeded");
                 }
             }
@@ -108,6 +102,7 @@ impl WsHub {
         self.connections.insert(
             conn_id,
             ClientInfo {
+                room_id,
                 buckets: allowed_buckets.clone(),
                 sender: sender.clone(),
             },
@@ -118,14 +113,6 @@ impl WsHub {
             let set = self.buckets.entry(*bucket).or_insert_with(HashSet::new);
             set.insert(conn_id);
         }
-
-        self.signal_sender
-            .try_send(KernelSignal::ClientConnected {
-                conn_id,
-                room_id,
-                allowed_buckets: allowed_buckets.clone(),
-            })
-            .ok();
 
         Ok(())
     }
@@ -141,22 +128,25 @@ impl WsHub {
                     }
                 }
             }
-
-            self.signal_sender
-                .try_send(KernelSignal::ClientDisconnected { conn_id })
-                .ok();
         }
     }
 
     pub async fn process_client_message(&self, conn_id: u64, msg: Value) {
-        self.command_sender
-            .send(ClientMessage { conn_id, msg })
-            .await
-            .ok();
+        if let Some(client) = self.connections.get(&conn_id) {
+            if let Err(err) = self
+                .command_sender
+                .send(Commands::WsMessage(client.room_id, msg))
+                .await
+            {
+                warn!(client = conn_id, %err, "ws client command channel closed");
+            }
+        } else {
+            warn!(client = conn_id, "ws client message dropped: unknown connection");
+        }
     }
 
-    pub async fn send_targeted_update(&self, client_id: &u64, update: &DataUpdate) -> bool {
-        let event = if update.value.is_some() {
+    fn update_event(update: &DataUpdate) -> Value {
+        if update.value.is_some() {
             json!({
                 "type": "update",
                 "bucket_id": update.bucket_id,
@@ -171,7 +161,11 @@ impl WsHub {
                 "bucket_counter": update.bucket_counter,
                 "key": update.key,
             })
-        };
+        }
+    }
+
+    pub async fn send_targeted_update(&mut self, client_id: &u64, update: &DataUpdate) -> bool {
+        let event = Self::update_event(update);
 
         if let Some(client) = self.connections.get(client_id) {
             if let Err(err) = client.sender.try_send(event.clone()) {
@@ -179,20 +173,23 @@ impl WsHub {
                 match err {
                     mpsc::error::TrySendError::Full(_) => {
                         error!(bucket_id = update.bucket_id, client = ?client_id, "ws client queue full, dropping client");
+                        self.remove_client(*client_id);
                         return true;
                     }
                     mpsc::error::TrySendError::Closed(_) => {
+                        self.remove_client(*client_id);
                         return true;
                     }
                 }
             }
         } else {
+            self.remove_client(*client_id);
             return true;
         }
         false
     }
 
-    /// Broadcast a room update event to interested WS clients with per-client backpressure protection.
+    /// Broadcast a bucket update event to interested WS clients with per-client backpressure protection.
     pub async fn broadcast_update(&mut self, update: &DataUpdate) {
         let bucket_id = &update.bucket_id;
 
@@ -205,27 +202,15 @@ impl WsHub {
 
     /// Spawn a background forwarder that receives `DataUpdate` notifications and
     /// forwards them to WS clients via `broadcast_update`.
-    /// Returns an `mpsc::Sender<DataUpdate>` producers can use to send updates.
-    pub async fn start(&mut self) {
-        if let Some(mut rx) = self.notification_receiver.take() {
-            while let Some(update) = rx.recv().await {
-                match update {
-                    UpdateChannelMessage::Broadcast(data_update) => {
-                        self.broadcast_update(&data_update).await;
-                    }
-                    UpdateChannelMessage::Targeted { conn_id, msg } => {
-                        if let Some(client) = self.connections.get(&conn_id) {
-                            if let Err(err) = client.sender.try_send(json!({
-                                "type": "update",
-                                "bucket_id": msg.bucket_id,
-                                "bucket_counter": msg.bucket_counter,
-                                "key": msg.key,
-                                "value": msg.value,
-                            })) {
-                                error!(client = ?conn_id, "error sending targeted update to client: %err");
-                            }
-                        }
-                    }
+    pub async fn run_forwarder(ws_hub: Arc<Mutex<WsHub>>, mut rx: mpsc::Receiver<UpdateChannelMessage>) {
+        while let Some(msg) = rx.recv().await {
+            let mut hub = ws_hub.lock().await;
+            match msg {
+                UpdateChannelMessage::Broadcast(data_update) => {
+                    hub.broadcast_update(&data_update).await;
+                }
+                UpdateChannelMessage::Targeted { conn_id, msg } => {
+                    hub.send_targeted_update(&conn_id, &msg).await;
                 }
             }
         }

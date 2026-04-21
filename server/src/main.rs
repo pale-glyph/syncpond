@@ -10,11 +10,11 @@ mod command;
 mod downstream;
 mod kernel;
 mod persistance;
-mod rate_limiter;
 mod state;
 mod upstream;
 
-use crate::downstream::hub::{ClientMessage, UpdateChannelMessage};
+use crate::command::Commands;
+use crate::downstream::hub::UpdateChannelMessage;
 use crate::downstream::hub::WsHub;
 use crate::kernel::KernelSignal;
 use crate::state::AppState;
@@ -35,8 +35,6 @@ struct SyncpondConfig {
     jwt_audience: Option<String>,
     jwt_ttl_seconds: Option<u64>,
     require_tls: Option<bool>,
-    ws_room_rate_limit: Option<usize>,
-    ws_room_rate_window_secs: Option<u64>,
     ws_allowed_origins: Option<Vec<String>>,
     save_dir: Option<String>,
 }
@@ -133,22 +131,15 @@ async fn main() -> Result<()> {
 
     // Channels for notification, commands (from WS clients -> kernel), and signals (to kernel).
     let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<UpdateChannelMessage>(1024);
-    let (command_tx, _command_rx) = tokio::sync::mpsc::channel::<ClientMessage>(1024);
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<Commands>(1024);
     let (signal_tx, signal_rx) = tokio::sync::mpsc::channel::<KernelSignal>(1024);
 
     // Inject senders into WsHub so external components can use them.
     let ws_hub = Arc::new(Mutex::new(WsHub::new(
         notification_rx,
         command_tx.clone(),
-        signal_tx.clone(),
     )));
 
-    let ws_room_rate_limit = config
-        .ws_room_rate_limit
-        .unwrap_or(DEFAULT_WS_ROOM_RATE_LIMIT);
-    let ws_room_rate_window_secs = config
-        .ws_room_rate_window_secs
-        .unwrap_or(DEFAULT_WS_ROOM_RATE_WINDOW_SECS);
     let ws_allowed_origins = config.ws_allowed_origins.clone().unwrap_or_else(|| {
         DEFAULT_WS_ALLOWED_ORIGINS
             .iter()
@@ -188,8 +179,7 @@ async fn main() -> Result<()> {
     let ws_server = crate::downstream::server::spawn_ws_server(
         ws_addr,
         ws_hub.clone(),
-        ws_room_rate_limit,
-        ws_room_rate_window_secs,
+        signal_tx.clone(),
         ws_allowed_origins.clone(),
         config.jwt_key.clone(),
         config.jwt_issuer.clone(),
@@ -207,7 +197,10 @@ async fn main() -> Result<()> {
         notification_tx.clone(),
     ));
 
-    // Start kernel background processors to handle signals from WS.
+    // Start kernel background processors to handle WS commands and signals.
+    let kernel_for_commands = kernel.clone();
+    kernel_for_commands.start_command_processor(command_rx);
+
     let kernel_for_signals = kernel.clone();
     kernel_for_signals.start_signal_processor(signal_rx);
 
@@ -252,8 +245,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-const DEFAULT_WS_ROOM_RATE_LIMIT: usize = 1000;
-const DEFAULT_WS_ROOM_RATE_WINDOW_SECS: u64 = 60;
 const DEFAULT_WS_ALLOWED_ORIGINS: &[&str] = &[];
 
 // legacy command helpers removed; no constant-time compare helper needed here

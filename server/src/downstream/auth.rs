@@ -5,8 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
-    pub room: String,
-    pub containers: Option<Vec<String>>,
+    pub buckets: Option<Vec<u64>>,
     pub exp: usize,
 }
 
@@ -52,22 +51,9 @@ pub fn validate_jwt_claims(
         return Err("expired_jwt".to_string());
     }
 
-    if claims.room.trim().is_empty() {
-        return Err("invalid_jwt_room".to_string());
-    }
-
-    if claims.sub != format!("room:{}", claims.room) {
-        return Err("invalid_jwt_sub".to_string());
-    }
-
-    if claims.room.parse::<u64>().is_err() {
-        return Err("invalid_jwt_room".to_string());
-    }
-
-    // Reject tokens that attempt to grant access to the reserved server-only container.
-    if let Some(containers) = &claims.containers {
-        if containers.iter().any(|c| c == "server_only") {
-            return Err("invalid_jwt_reserved_container".to_string());
+    if let Some(buckets) = &claims.buckets {
+        if buckets.iter().any(|id| *id == crate::state::SERVER_ONLY_BUCKET_ID) {
+            return Err("invalid_jwt_reserved_bucket".to_string());
         }
     }
 

@@ -11,7 +11,7 @@ message ListRoomsResponse { repeated string rooms = 1; }
 message DeleteRoomRequest { uint64 room_id = 1; }
 message DeleteRoomResponse {}
 
-message IssueJwtRequest { uint64 room_id = 1; repeated string containers = 2; }
+message IssueJwtRequest { uint64 room_id = 1; string sub = 2; repeated uint64 buckets = 3; }
 message IssueJwtResponse { string jwt = 1; }
 
 message CreateBucketRequest { uint64 room_id = 1; uint64 bucket_id = 2; string label = 3; }

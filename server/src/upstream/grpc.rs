@@ -55,15 +55,16 @@ impl CommandService for CommandServiceImpl {
     ) -> Result<Response<proto::IssueJwtResponse>, Status> {
         let req = request.into_inner();
         let room_id = req.room_id;
-        let containers = req.containers;
+        let sub = req.sub;
+        let buckets = req.buckets;
 
-        match self.inner.issue_jwt(room_id, containers).await {
+        match self.inner.issue_jwt(room_id, sub, buckets).await {
             Ok(token) => Ok(Response::new(proto::IssueJwtResponse { jwt: token })),
             Err(e) => {
                 // map known error strings to appropriate gRPC statuses
                 match e.as_str() {
                     "room_not_found" => Err(Status::not_found(e)),
-                    "reserved_container_name" => Err(Status::invalid_argument(e)),
+                    "reserved_bucket_id" => Err(Status::invalid_argument(e)),
                     "jwt_key_not_configured" | "jwt_key_too_short" | "jwt_issuer_audience_not_configured" => {
                         Err(Status::failed_precondition(e))
                     }
