@@ -8,9 +8,6 @@ use tracing::error;
 pub const MAX_WS_CLIENTS_PER_ROOM: usize = 200;
 pub const MAX_WS_PENDING_MESSAGES: usize = 256;
 
-/// Reserved bucket id for server-only data.
-pub const SERVER_ONLY_BUCKET_ID: u64 = u64::MAX;
-
 /// Data update event for downstream/hub internal use. This mirrors the
 /// information produced by `state::RoomUpdate` but is defined in the
 /// downstream package so the downstream API can evolve independently.
@@ -43,11 +40,14 @@ pub struct ClientInfo {
 pub struct WsHub {
     /// Next auto-incrementing connection id.
     next_conn_id: u64,
-    /// Global map: connection id -> ClientInfo.
+
+    /// map: connection id -> ClientInfo.
     connections: HashMap<u64, ClientInfo>,
     /// Map of bucket_id -> set of connection ids.
     buckets: HashMap<u64, HashSet<u64>>,
-    notification_receiver: mpsc::Receiver<DataUpdate>,
+
+    // Channels
+    notification_receiver: Option<mpsc::Receiver<DataUpdate>>,
     command_sender: mpsc::Sender<ClientMessage>,
     signal_sender: mpsc::Sender<KernelSignal>,
 }
@@ -62,10 +62,17 @@ impl WsHub {
             next_conn_id: 1,
             connections: HashMap::new(),
             buckets: HashMap::new(),
-            notification_receiver,
+            notification_receiver: Some(notification_receiver),
             command_sender,
             signal_sender,
         }
+    }
+
+    /// Take ownership of the notification receiver out of the hub so a
+    /// dedicated forwarder task can receive updates and call
+    /// `broadcast_update` while only briefly locking the hub.
+    pub fn take_notification_receiver(&mut self) -> Option<mpsc::Receiver<DataUpdate>> {
+        self.notification_receiver.take()
     }
 
     /// Allocate and return a new connection id.
@@ -79,6 +86,7 @@ impl WsHub {
     pub fn add_client(
         &mut self,
         conn_id: u64,
+        room_id: u64,
         allowed_buckets: HashSet<u64>,
         sender: mpsc::Sender<Value>,
     ) -> Result<(), &'static str> {
@@ -107,7 +115,7 @@ impl WsHub {
         }
 
         self.signal_sender
-            .try_send(KernelSignal::ClientConnected { conn_id })
+            .try_send(KernelSignal::ClientConnected { conn_id, room_id, allowed_buckets: allowed_buckets.clone() })
             .ok();
 
         Ok(())
@@ -192,8 +200,10 @@ impl WsHub {
     /// forwards them to WS clients via `broadcast_update`.
     /// Returns an `mpsc::Sender<DataUpdate>` producers can use to send updates.
     pub async fn start(&mut self) {
-        while let Some(update) = self.notification_receiver.recv().await {
-            self.broadcast_update(update).await;
+        if let Some(mut rx) = self.notification_receiver.take() {
+            while let Some(update) = rx.recv().await {
+                self.broadcast_update(update).await;
+            }
         }
     }
 }

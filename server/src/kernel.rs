@@ -5,7 +5,7 @@ use crate::persistance::PersistenceManager;
 use crate::downstream::hub::WsHub;
 use crate::rate_limiter::RateLimiter;
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::sync::{Mutex, mpsc};
 // connection ids are numeric u64 allocated by WsHub
 use tracing::{debug, error, info};
@@ -15,7 +15,7 @@ use tracing::{debug, error, info};
 pub enum KernelSignal {
     Shutdown,
     Custom(String),
-    ClientConnected { conn_id: u64 },
+    ClientConnected { conn_id: u64, room_id: u64, allowed_buckets: HashSet<u64> },
     ClientDisconnected { conn_id: u64 },
 }
 
@@ -35,6 +35,7 @@ pub struct SyncpondKernel {
     pub ws_update_rate_limit: usize,
     pub ws_update_rate_window_secs: u64,
     pub persistence: Arc<PersistenceManager>,
+    pub notification_sender: mpsc::Sender<DataUpdate>,
 }
 
 impl SyncpondKernel {
@@ -45,6 +46,7 @@ impl SyncpondKernel {
         ws_update_rate_limit: usize,
         ws_update_rate_window_secs: u64,
         persistence: Arc<PersistenceManager>,
+        notification_sender: mpsc::Sender<DataUpdate>,
     ) -> Self {
         Self {
             state,
@@ -53,6 +55,7 @@ impl SyncpondKernel {
             ws_update_rate_limit,
             ws_update_rate_window_secs,
             persistence,
+            notification_sender,
         }
     }
 
@@ -80,6 +83,12 @@ impl SyncpondKernel {
                     }
                     KernelSignal::Custom(s) => {
                         info!(signal = %s, "kernel received custom signal");
+                    }
+                    KernelSignal::ClientConnected { conn_id, room_id, allowed_buckets } => {
+                        info!(conn = conn_id, room = room_id, allowed_buckets = allowed_buckets.len(), "client connected");
+                    }
+                    KernelSignal::ClientDisconnected { conn_id } => {
+                        info!(conn = conn_id, "client disconnected");
                     }
                 }
             }
@@ -211,18 +220,13 @@ impl SyncpondKernel {
                 };
 
                 let update = DataUpdate {
-                    room_id,
-                    bucket_id: Some(0),
+                    bucket_id: 0u64,
                     key: key.clone(),
                     value: Some(parsed),
                     bucket_counter: room_counter,
                 };
 
-                let sender = {
-                    let hub = self.ws_hub.lock().await;
-                    hub.notification_sender()
-                };
-                if let Err(err) = sender.try_send(update) {
+                if let Err(err) = self.notification_sender.try_send(update) {
                     error!(room = room_id, %err, "notification channel send failed, dropping update");
                 }
 

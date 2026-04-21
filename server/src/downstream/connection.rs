@@ -1,12 +1,11 @@
 use crate::downstream::auth::{AuthMessage, validate_jwt_claims};
 use crate::downstream::hub::{WsHub, MAX_WS_PENDING_MESSAGES};
 use crate::rate_limiter::RateLimiter;
-use crate::state::SharedState;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -24,13 +23,15 @@ use tracing::{debug, error, info, warn};
 pub async fn handle_ws_connection(
     stream: TcpStream,
     peer: SocketAddr,
-    state: SharedState,
     ws_hub: Arc<Mutex<WsHub>>,
     auth_rate_limiter: Arc<RateLimiter>,
     _ws_room_rate_limiter: Arc<RateLimiter>,
     ws_auth_rate_limit: usize,
     ws_auth_rate_window_secs: u64,
     ws_allowed_origins: Vec<String>,
+    jwt_key: Option<String>,
+    jwt_issuer: Option<String>,
+    jwt_audience: Option<String>,
 ) -> Result<()> {
     let key = peer.ip().to_string();
     let allowed = auth_rate_limiter
@@ -87,10 +88,6 @@ pub async fn handle_ws_connection(
             txt
         }
         Some(Ok(_)) => {
-            {
-                let mut app = state.write().await;
-                app.ws_auth_failure += 1;
-            }
             warn!(%peer, reason = "invalid_auth_message", "ws auth failure");
             let err = json!({"type":"auth_error","reason":"invalid_auth_message"});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
@@ -103,10 +100,6 @@ pub async fn handle_ws_connection(
     let auth_msg: AuthMessage = match serde_json::from_str(&auth_text) {
         Ok(v) => v,
         Err(_) => {
-            {
-                let mut app = state.write().await;
-                app.ws_auth_failure += 1;
-            }
             warn!(%peer, reason = "invalid_json", "ws auth failure");
             let err = json!({"type":"auth_error","reason":"invalid_json"});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
@@ -116,42 +109,25 @@ pub async fn handle_ws_connection(
     debug!(%peer, auth_type = %auth_msg.typ, last_seen = ?auth_msg.last_seen_counter, "parsed auth message");
 
     if auth_msg.typ != "auth" {
-        debug!(%peer, "acquiring state.write for missing_auth");
-        {
-            let mut app = state.write().await;
-            app.ws_auth_failure += 1;
-        }
-        debug!(%peer, "released state.write after missing_auth increment");
+        debug!(%peer, "missing auth message");
         warn!(%peer, reason = "missing_auth", "ws auth failure");
         let err = json!({"type":"auth_error","reason":"missing_auth"});
         ws_sender.send(Message::Text(err.to_string())).await.ok();
         return Ok(());
     }
 
-    debug!(%peer, "attempting state.read to validate jwt claims");
-    let claims_res = {
-        let app_read = state.read().await;
-        debug!(%peer, "acquired state.read for jwt claims");
-        validate_jwt_claims(&app_read, &auth_msg.jwt)
-    };
-    debug!(%peer, "released state.read after jwt claims validation");
-    let claims = match claims_res {
+    debug!(%peer, "validating jwt claims");
+    let claims = match validate_jwt_claims(
+        jwt_key.as_deref(),
+        jwt_issuer.as_deref(),
+        jwt_audience.as_deref(),
+        &auth_msg.jwt,
+    ) {
         Ok(claims) => {
-            // auth success counter
-            debug!(%peer, "acquiring state.write to increment ws_auth_success");
-            let mut app = state.write().await;
-            app.ws_auth_success += 1;
-            debug!(%peer, "released state.write after ws_auth_success increment");
             info!(%peer, room = %claims.room, "ws auth success");
             claims
         }
         Err(reason) => {
-            debug!(%peer, "acquiring state.write to increment ws_auth_failure (invalid_jwt)");
-            {
-                let mut app = state.write().await;
-                app.ws_auth_failure += 1;
-            }
-            debug!(%peer, "released state.write after ws_auth_failure increment");
             warn!(%peer, %reason, "ws auth failure: invalid_jwt");
             let err = json!({"type":"auth_error","reason":"invalid_jwt","detail": reason});
             ws_sender.send(Message::Text(err.to_string())).await.ok();
@@ -190,61 +166,21 @@ pub async fn handle_ws_connection(
                 continue;
             }
         }
-        // try to resolve label -> bucket id via state
-        let label_lookup = {
-            let app = state.read().await;
-            if let Some(room_arc) = app.rooms.get(&room_id) {
-                if let Ok(room) = room_arc.read() {
-                    room.bucket_labels
-                        .iter()
-                        .find_map(|(id, lbl)| if lbl == c { Some(*id) } else { None })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(id) = label_lookup {
-            allowed_buckets.insert(id);
-        }
+        // No SharedState access here: ignore human-friendly labels for now.
     }
 
     // ensure public bucket is included
     allowed_buckets.insert(0);
 
-    debug!(%peer, room_id = room_id, "acquiring state.read for room snapshot");
-    let room_state_snapshot = {
-        let app = state.read().await;
-        debug!(%peer, room_id = room_id, "acquired state.read for room snapshot");
-        app.room_snapshot(room_id, &allowed_buckets)
-    };
-    let room_state_snapshot = match room_state_snapshot {
-        Some(s) => s,
-        None => {
-            let err = json!({"type":"auth_error","reason":"room_not_found"});
-            ws_sender.send(Message::Text(err.to_string())).await.ok();
-            return Ok(());
-        }
-    };
-    let bucket_count = room_state_snapshot
-        .get("buckets")
-        .and_then(|c| c.as_object())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    debug!(%peer, room_id = room_id, bucket_count, "prepared room snapshot");
-
-    debug!(%peer, room_id = room_id, "acquiring state.read for room version");
-    let room_counter = {
-        let app = state.read().await;
-        debug!(%peer, room_id = room_id, "acquired state.read for room version");
-        app.room_version(room_id).unwrap_or(0)
-    };
+    // No initial snapshot from SharedState here. Kernel will send updates.
+    let bucket_count = 0usize;
+    let room_counter = 0u64;
+    debug!(%peer, room_id = room_id, bucket_count, "prepared empty room snapshot");
 
     let auth_ok = json!({
         "type": "auth_ok",
         "room_counter": room_counter,
-        "state": room_state_snapshot,
+        "state": { "room_counter": room_counter, "buckets": {} },
     });
 
     debug!(%peer, room_id = room_id, "sending auth_ok");
@@ -255,7 +191,7 @@ pub async fn handle_ws_connection(
     let add_res = {
         let mut hub = ws_hub.lock().await;
         let conn_id = hub.allocate_connection_id();
-        match hub.add_client(conn_id, allowed_buckets.clone(), tx.clone()) {
+        match hub.add_client(conn_id, room_id, allowed_buckets.clone(), tx.clone()) {
             Ok(()) => Ok(conn_id),
             Err(e) => Err(e),
         }
@@ -269,14 +205,7 @@ pub async fn handle_ws_connection(
     let conn_id = add_res.unwrap();
     info!(%peer, room_id = room_id, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client added");
 
-    {
-        let mut app = state.write().await;
-        app.total_ws_connections = app.total_ws_connections.saturating_add(1);
-        info!(
-            total_ws_connections = app.total_ws_connections,
-            "ws connections after auth"
-        );
-    }
+    info!(%peer, room_id = room_id, "ws client authenticated and added");
 
     loop {
         tokio::select! {
@@ -325,10 +254,6 @@ pub async fn handle_ws_connection(
                         debug!(%peer, "forwarding event to ws client");
                         if let Err(err) = ws_sender.send(Message::Text(event.to_string())).await {
                             error!(%err, "ws outgoing error");
-                            {
-                                let mut app = state.write().await;
-                                app.ws_send_errors = app.ws_send_errors.saturating_add(1);
-                            }
                             break;
                         }
                     }
@@ -343,20 +268,7 @@ pub async fn handle_ws_connection(
         hub.remove_client(conn_id);
     }
 
-    {
-        let mut app = state.write().await;
-        app.total_ws_connections = app.total_ws_connections.saturating_sub(1);
-        let elapsed_ns = connection_start.elapsed().as_nanos();
-        app.ws_connection_latency_ns_total = app
-            .ws_connection_latency_ns_total
-            .saturating_add(elapsed_ns);
-        app.ws_connection_count += 1;
-        info!(
-            total_ws_connections = app.total_ws_connections,
-            ws_connection_elapsed_ms = elapsed_ns as f64 / 1_000_000.0,
-            "ws connections after close"
-        );
-    }
+    info!(%peer, "ws client disconnected");
 
     Ok(())
 }

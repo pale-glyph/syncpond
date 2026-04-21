@@ -15,21 +15,15 @@ mod state;
 mod upstream;
 
 use crate::downstream::hub::ClientMessage;
-use crate::downstream::connection::handle_ws_connection;
 use crate::downstream::hub::{DataUpdate, WsHub};
 use crate::kernel::KernelSignal;
 use crate::rate_limiter::RateLimiter;
 use crate::state::{AppState, SharedState};
 use anyhow::{Context, Result};
-use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use std::{fs, net::SocketAddr, path::Path, sync::Arc};
 
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock},
-};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
 #[derive(Debug, Deserialize)]
@@ -177,8 +171,7 @@ async fn main() -> Result<()> {
             .collect()
     });
 
-    // Spawn the forwarder task that reads notifications and forwards to connected WS clients.
-    ws_hub.lock().await.start().await;
+    // Downstream subsystem (forwarder + ws + health) will be started below.
 
     if config.command_api_key.trim().is_empty() {
         anyhow::bail!("command_api_key must be configured and non-empty");
@@ -217,81 +210,27 @@ async fn main() -> Result<()> {
         anyhow::bail!("health_bind_loopback_only=true but health_addr is not loopback");
     }
 
-    let ws_state = shared_state.clone();
-    let ws_hub_for_ws = ws_hub.clone();
+    // Spawn the websocket server; pass JWT config so downstream doesn't need SharedState.
+    let ws_server = crate::downstream::server::spawn_ws_server(
+        ws_addr,
+        ws_hub.clone(),
+        ws_auth_rate_limiter.clone(),
+        ws_room_rate_limiter_for_ws.clone(),
+        ws_auth_rate_limit,
+        ws_auth_rate_window_secs,
+        ws_allowed_origins.clone(),
+        config.jwt_key.clone(),
+        config.jwt_issuer.clone(),
+        config.jwt_audience.clone(),
+    );
 
-    let ws_addr_for_task = ws_addr.clone();
-
-    let ws_server = tokio::spawn(async move {
-        let listener = TcpListener::bind(ws_addr_for_task)
-            .await
-            .context("ws bind failed")?;
-        info!(
-            "syncpond websocket server listening on {}",
-            ws_addr_for_task
-        );
-
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            let state = ws_state.clone();
-            let hub = ws_hub_for_ws.clone();
-            let auth_limiter = ws_auth_rate_limiter.clone();
-            let room_limiter = ws_room_rate_limiter_for_ws.clone();
-            let ws_allowed_origins_for_conn = ws_allowed_origins.clone();
-            tokio::spawn(async move {
-                if let Err(err) = handle_ws_or_docs_connection(
-                    stream,
-                    peer,
-                    state,
-                    hub,
-                    auth_limiter,
-                    room_limiter,
-                    ws_auth_rate_limit,
-                    ws_auth_rate_window_secs,
-                    ws_allowed_origins_for_conn,
-                )
-                .await
-                {
-                    error!(%err, peer = %peer, "ws/http connection error");
-                }
-            });
-        }
-
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    });
-
-    // legacy TCP command server removed; use upstream gRPC for trusted application servers
-
-    let health_state = shared_state.clone();
-    let health_addr_for_task = health_addr.clone();
-    let health_server = tokio::spawn(async move {
-        info!(
-            "syncpond health server listening on {}",
-            health_addr_for_task
-        );
-        let listener = TcpListener::bind(health_addr_for_task)
-            .await
-            .context("health bind failed")?;
-
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            let state = health_state.clone();
-            tokio::spawn(async move {
-                if health_bind_loopback_only && !peer.ip().is_loopback() {
-                    error!(%peer, "rejected non-loopback health connection");
-                    return;
-                }
-
-                if let Err(err) = handle_health_connection(stream, state).await {
-                    error!(%err, peer = %peer, "health connection error");
-                }
-            });
-        }
-
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    });
+    // Start the downstream forwarder and health server (health no longer uses AppState).
+    let (forwarder, health_server) = crate::downstream::server::start_downstream(
+        health_addr,
+        ws_hub.clone(),
+        health_bind_loopback_only,
+    )
+    .await?;
 
     // build the Kernel which coordinates state and downstream components
     let kernel = Arc::new(crate::kernel::SyncpondKernel::new(
@@ -301,6 +240,7 @@ async fn main() -> Result<()> {
         ws_room_rate_limit,
         ws_room_rate_window_secs,
         persistence.clone(),
+        notification_tx.clone(),
     ));
 
     // Start kernel background processors to handle commands and signals from WS.
@@ -340,6 +280,7 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         res = shutdown => res?,
+        res = forwarder => res??,
         res = ws_server => res??,
         res = health_server => res??,
         res = grpc_server => res??,
@@ -359,210 +300,4 @@ const DEFAULT_WS_ALLOWED_ORIGINS: &[&str] = &[];
 
 // legacy command helpers removed; no constant-time compare helper needed here
 
-async fn read_line_with_limit<R>(reader: &mut BufReader<R>, line: &mut String) -> Result<usize>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    line.clear();
-    let mut total = 0usize;
-    loop {
-        let buf = reader.fill_buf().await?;
-        if buf.is_empty() {
-            break;
-        }
-        let newline_pos = buf.iter().position(|&b| b == b'\n');
-        let consume_len = newline_pos.map(|p| p + 1).unwrap_or(buf.len());
-        total += consume_len;
-        if total > MAX_COMMAND_LINE_LEN {
-            anyhow::bail!("line_too_long");
-        }
-        let chunk = std::str::from_utf8(&buf[..consume_len])
-            .map_err(|e| anyhow::anyhow!("invalid utf8: {}", e))?;
-        line.push_str(chunk);
-        reader.consume(consume_len);
-        if newline_pos.is_some() {
-            break;
-        }
-    }
-    Ok(total)
-}
-
-async fn handle_health_connection(stream: TcpStream, state: SharedState) -> Result<()> {
-    let (reader, writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
-    let mut line = String::new();
-
-    let bytes = read_line_with_limit(&mut reader, &mut line).await?;
-    if bytes == 0 {
-        return Ok(());
-    }
-
-    let parts: Vec<&str> = line.trim_end().split_whitespace().collect();
-    let (status, body) = if parts.len() >= 2 && parts[0] == "GET" {
-        match parts[1] {
-            "/health" => ("200 OK", "ok".to_string()),
-            "/metrics" => {
-                let app = state.read().await;
-                (
-                    "200 OK",
-                    serde_json::to_string(&app.metrics()).unwrap_or_else(|_| "{}".into()),
-                )
-            }
-            _ => ("404 Not Found", "not found".to_string()),
-        }
-    } else {
-        ("400 Bad Request", "bad request".to_string())
-    };
-
-    let response = format!(
-        "HTTP/1.1 {}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\n\r\n{}",
-        status,
-        body.len(),
-        body
-    );
-
-    writer.write_all(response.as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-static DOC_DIR: Dir = include_dir!("doc");
-
-fn html_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn make_doc_index_html() -> String {
-    let mut html = String::from(
-        "<html><head><title>syncpond docs</title></head><body><h1>syncpond docs</h1><ul>",
-    );
-    for entry in DOC_DIR.entries() {
-        if let Some(path) = entry.path().to_str() {
-            let escaped = html_escape(path);
-            if entry.as_dir().is_some() {
-                html.push_str(&format!(
-                    "<li><a href=\"/docs/{}\">{}/</a></li>",
-                    escaped, escaped
-                ));
-            } else if entry.as_file().is_some() {
-                html.push_str(&format!(
-                    "<li><a href=\"/docs/{}\">{}</a></li>",
-                    escaped, escaped
-                ));
-            }
-        }
-    }
-    html.push_str("</ul></body></html>");
-    html
-}
-
-async fn serve_docs_connection(mut stream: TcpStream, request: &str) -> Result<()> {
-    let mut lines = request.lines();
-    let request_line = lines.next().unwrap_or("");
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    let path = if parts.len() >= 2 { parts[1] } else { "/" };
-
-    let (status, content_type, body) = if path == "/" || path == "/docs" || path == "/docs/" {
-        ("200 OK", "text/html; charset=utf-8", make_doc_index_html())
-    } else if let Some(stripped) = path.strip_prefix("/docs/") {
-        if let Some(file) = DOC_DIR.get_file(stripped) {
-            let content = file.contents_utf8().unwrap_or_default().to_string();
-            let content_type =
-                if Path::new(stripped).extension().and_then(|e| e.to_str()) == Some("md") {
-                    "text/markdown; charset=utf-8"
-                } else {
-                    "text/plain; charset=utf-8"
-                };
-            ("200 OK", content_type, content)
-        } else if let Some(dir) = DOC_DIR.get_dir(stripped) {
-            let mut html = format!(
-                "<html><head><title>{}</title></head><body><h1>Index of {}</h1><ul>",
-                path, path
-            );
-            for entry in dir.entries() {
-                if let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) {
-                    let escaped = html_escape(name);
-                    let href = format!("{}/{}", path.trim_end_matches('/'), escaped);
-                    let label = if entry.as_dir().is_some() {
-                        format!("{}/", escaped)
-                    } else {
-                        escaped.clone()
-                    };
-                    html.push_str(&format!("<li><a href=\"{}\">{}</a></li>", href, label));
-                }
-            }
-            html.push_str("</ul></body></html>");
-            ("200 OK", "text/html; charset=utf-8", html)
-        } else {
-            (
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                "not found".to_string(),
-            )
-        }
-    } else {
-        (
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            "not found".to_string(),
-        )
-    };
-
-    let response = format!(
-        "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n\r\n{}",
-        status,
-        content_type,
-        body.len(),
-        body
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-async fn handle_ws_or_docs_connection(
-    buf_stream: TcpStream,
-    peer: SocketAddr,
-    state: SharedState,
-    ws_hub: Arc<Mutex<WsHub>>,
-    auth_rate_limiter: Arc<RateLimiter>,
-    ws_room_rate_limiter: Arc<RateLimiter>,
-    ws_auth_rate_limit: usize,
-    ws_auth_rate_window_secs: u64,
-    ws_allowed_origins: Vec<String>,
-) -> Result<()> {
-    let mut peek_buf = [0u8; 16384];
-    let n = buf_stream.peek(&mut peek_buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-
-    let req_text = String::from_utf8_lossy(&peek_buf[..n]);
-    let is_http_get = req_text.starts_with("GET ");
-    let is_ws_upgrade = req_text.to_lowercase().contains("upgrade: websocket");
-
-    if is_http_get && !is_ws_upgrade {
-        return serve_docs_connection(buf_stream, &req_text).await;
-    }
-
-    // from here on, assume WebSocket connection.
-    handle_ws_connection(
-        buf_stream,
-        peer,
-        state,
-        ws_hub,
-        auth_rate_limiter,
-        ws_room_rate_limiter,
-        ws_auth_rate_limit,
-        ws_auth_rate_window_secs,
-        ws_allowed_origins,
-    )
-    .await
-}
-// legacy TCP command connection function removed; use upstream gRPC for trusted application servers
+// `read_line_with_limit` and health/docs HTTP handlers live under `downstream` now.

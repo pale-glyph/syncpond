@@ -1,4 +1,3 @@
-use crate::state::AppState;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,11 +18,13 @@ pub struct AuthMessage {
     pub last_seen_counter: Option<u64>,
 }
 
-pub fn validate_jwt_claims(app: &AppState, token: &str) -> Result<Claims, String> {
-    let jwt_key = app
-        .jwt_key
-        .as_ref()
-        .ok_or_else(|| "no_jwt_key".to_string())?;
+pub fn validate_jwt_claims(
+    jwt_key: Option<&str>,
+    jwt_issuer: Option<&str>,
+    jwt_audience: Option<&str>,
+    token: &str,
+) -> Result<Claims, String> {
+    let jwt_key = jwt_key.ok_or_else(|| "no_jwt_key".to_string())?;
 
     let mut validation = Validation::new(Algorithm::HS256);
     // Explicitly lock algorithms to prevent algorithm confusion attacks.
@@ -32,19 +33,15 @@ pub fn validate_jwt_claims(app: &AppState, token: &str) -> Result<Claims, String
     validation.set_required_spec_claims(&["exp"]);
     validation.validate_exp = true;
 
-    if let Some(issuer) = app.jwt_issuer.as_ref() {
+    if let Some(issuer) = jwt_issuer {
         validation.set_issuer(&[issuer]);
     }
-    if let Some(audience) = app.jwt_audience.as_ref() {
+    if let Some(audience) = jwt_audience {
         validation.set_audience(&[audience]);
     }
 
-    let token_data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(jwt_key.as_ref()),
-        &validation,
-    )
-    .map_err(|e| format!("invalid_jwt:{}", e))?;
+    let token_data = decode::<Claims>(token, &DecodingKey::from_secret(jwt_key.as_ref()), &validation)
+        .map_err(|e| format!("invalid_jwt:{}", e))?;
 
     let claims = token_data.claims;
     let now = SystemTime::now()
