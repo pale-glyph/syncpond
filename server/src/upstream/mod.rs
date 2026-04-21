@@ -1,4 +1,3 @@
-use super::state::rooms::FragmentFlags;
 use std::sync::Arc;
 
 pub mod grpc;
@@ -15,18 +14,6 @@ pub struct CommandServer {
 impl CommandServer {
     pub fn new(kernel: Arc<crate::kernel::SyncpondKernel>) -> Self {
         CommandServer { kernel }
-    }
-
-    pub async fn start(&self) {
-        // nothing to run for now; kept for API compatibility
-    }
-
-    pub async fn stop(&self) {
-        // nothing to stop for now
-    }
-
-    pub async fn handle_command(&self, command: Commands) -> CommandResponse {
-        self.kernel.handle_command(command).await
     }
 
     pub async fn new_room(&self, name: String) -> u64 {
@@ -84,15 +71,9 @@ impl CommandServer {
         if let Some(room_arc) = app.rooms.get(&room_id) {
             if let Ok(room) = room_arc.read() {
                 let mut ids: Vec<u64> = room
-                    .containers
+                    .buckets
                     .keys()
-                    .filter_map(|name| {
-                        if let Some(sfx) = name.strip_prefix("bucket_") {
-                            sfx.parse::<u64>().ok()
-                        } else {
-                            None
-                        }
-                    })
+                    .copied()
                     .collect();
                 ids.sort_unstable();
                 return ids

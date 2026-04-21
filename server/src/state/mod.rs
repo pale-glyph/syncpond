@@ -1,7 +1,10 @@
 pub mod rooms;
 
-use jsonwebtoken::{EncodingKey, Header, encode};
+use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
+/// Bucket flag bits indicating metadata for a bucket.
+/// - `BUCKET_FLAG_PERSISTED`: bucket has been persisted to storage.
+/// - `BUCKET_FLAG_SYNCHRONISED`: bucket has been synchronised with downstream clients.
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -12,6 +15,9 @@ use std::{
 use tokio::sync::RwLock;
 
 pub type SharedState = Arc<RwLock<AppState>>;
+
+/// Reserved bucket id for server-only data within state module.
+pub const SERVER_ONLY_BUCKET_ID: u64 = u64::MAX;
 
 /// Event produced when a room's data changes that should be broadcast to WS clients.
 #[derive(Debug, Clone)]
@@ -33,7 +39,8 @@ pub struct FragmentEntry {
 
 #[derive(Debug)]
 pub struct RoomState {
-    pub containers: HashMap<String, HashMap<String, FragmentEntry>>,
+    /// Map of bucket id -> (map of key -> FragmentEntry)
+    pub buckets: HashMap<u64, HashMap<String, FragmentEntry>>,
     pub room_counter: u64,
     pub tx_buffer: Option<Vec<RoomCommand>>,
     /// Set to `true` while a SAVE or LOAD is in progress for this room.
@@ -42,17 +49,19 @@ pub struct RoomState {
     /// Optional human-friendly labels for buckets in this room.
     /// Maps numeric bucket id -> label string.
     pub bucket_labels: HashMap<u64, String>,
+    /// Bitflags for buckets in this room. Keyed by numeric bucket id.
+    pub bucket_flags: HashMap<u64, u32>,
 }
 
 #[derive(Debug)]
 pub enum RoomCommand {
     Set {
-        container: String,
+        bucket_id: u64,
         key: String,
         value: Value,
     },
     Del {
-        container: String,
+        bucket_id: u64,
         key: String,
     },
 }
@@ -63,8 +72,8 @@ pub enum StateError {
     /// Room was not found.
     RoomNotFound,
 
-    /// Container was not found.
-    ContainerNotFound,
+    /// Bucket was not found.
+    BucketNotFound,
 
     /// Fragment/key was not found.
     FragmentNotFound,
@@ -86,8 +95,8 @@ pub enum StateError {
 
     /// JWT key is too weak.
     JwtKeyTooShort,
-    /// Container name reserved for server-only data; cannot be granted to clients via JWTs.
-    ReservedContainerName,
+    /// Bucket id reserved for server-only data; cannot be granted to clients via JWTs.
+    ReservedBucketId,
 
     /// Command API key is blank/invalid.
     CommandApiKeyInvalid,
@@ -105,7 +114,7 @@ impl std::fmt::Display for StateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StateError::RoomNotFound => write!(f, "room_not_found"),
-            StateError::ContainerNotFound => write!(f, "container_not_found"),
+            StateError::BucketNotFound => write!(f, "bucket_not_found"),
             StateError::FragmentNotFound => write!(f, "not_found"),
             StateError::FragmentTombstone => write!(f, "tombstone"),
             StateError::TxNotOpen => write!(f, "tx_not_open"),
@@ -115,7 +124,7 @@ impl std::fmt::Display for StateError {
                 write!(f, "jwt_issuer_audience_not_configured")
             }
             StateError::JwtKeyTooShort => write!(f, "jwt_key_too_short"),
-            StateError::ReservedContainerName => write!(f, "reserved_container_name"),
+            StateError::ReservedBucketId => write!(f, "reserved_bucket_id"),
             StateError::CommandApiKeyInvalid => write!(f, "command_api_key_invalid"),
             StateError::LabelNotFound => write!(f, "label_not_found"),
             StateError::LabelInUse => write!(f, "label_in_use"),
@@ -123,7 +132,6 @@ impl std::fmt::Display for StateError {
             StateError::RoomIoBusy => write!(f, "room_io_busy"),
         }
     }
-
 }
 
 impl std::error::Error for StateError {}
@@ -206,11 +214,12 @@ impl AppState {
         self.rooms.insert(
             room_id,
             Arc::new(StdRwLock::new(RoomState {
-                containers: HashMap::new(),
+                buckets: HashMap::new(),
                 room_counter: 0,
                 tx_buffer: None,
                 io_locked: false,
                 bucket_labels: HashMap::new(),
+                bucket_flags: HashMap::new(),
             })),
         );
         room_id
@@ -271,7 +280,12 @@ impl AppState {
 
     /// Set a human-friendly label for a bucket in a room. Labels are informational
     /// only and do not need to be unique across buckets or rooms.
-    pub fn set_bucket_label(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), StateError> {
+    pub fn set_bucket_label(
+        &self,
+        room_id: u64,
+        bucket_id: u64,
+        label: String,
+    ) -> Result<(), StateError> {
         let label_trimmed = label.trim();
         if label_trimmed.is_empty() || label_trimmed.len() > 256 {
             return Err(StateError::LabelInvalid);
@@ -283,13 +297,13 @@ impl AppState {
             return Err(StateError::RoomIoBusy);
         }
 
-        // Ensure the bucket/container exists
-        let bucket_name = format!("bucket_{}", bucket_id);
-        if !room.containers.contains_key(&bucket_name) {
-            return Err(StateError::ContainerNotFound);
+        // Ensure the bucket exists
+        if !room.buckets.contains_key(&bucket_id) {
+            return Err(StateError::BucketNotFound);
         }
 
-        room.bucket_labels.insert(bucket_id, label_trimmed.to_string());
+        room.bucket_labels
+            .insert(bucket_id, label_trimmed.to_string());
         Ok(())
     }
 
@@ -302,11 +316,11 @@ impl AppState {
         None
     }
 
-    /// Set a fragment value in a container within a room.
+    /// Set a fragment value in a bucket within a room.
     pub fn set_fragment(
         &self,
         room_id: u64,
-        container: String,
+        bucket_id: u64,
         key: String,
         value: Value,
     ) -> Result<(), StateError> {
@@ -318,7 +332,7 @@ impl AppState {
 
         if let Some(buffer) = room.tx_buffer.as_mut() {
             buffer.push(RoomCommand::Set {
-                container,
+                bucket_id,
                 key,
                 value,
             });
@@ -327,17 +341,24 @@ impl AppState {
 
         room.room_counter += 1;
         let key_version = room.room_counter;
-        let container_map = room.containers.entry(container).or_default();
-        container_map.insert(key, FragmentEntry { value, key_version, persisted: false });
+        let bucket_map = room.buckets.entry(bucket_id).or_default();
+        bucket_map.insert(
+            key,
+            FragmentEntry {
+                value,
+                key_version,
+                persisted: false,
+            },
+        );
 
         Ok(())
     }
 
-    /// Delete (tombstone) a fragment key in a room container.
+    /// Delete (tombstone) a fragment key in a room bucket.
     pub fn del_fragment(
         &self,
         room_id: u64,
-        container: String,
+        bucket_id: u64,
         key: String,
     ) -> Result<(), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
@@ -347,18 +368,18 @@ impl AppState {
         }
 
         if let Some(buffer) = room.tx_buffer.as_mut() {
-            buffer.push(RoomCommand::Del { container, key });
+            buffer.push(RoomCommand::Del { bucket_id, key });
             return Ok(());
         }
 
-        if !room.containers.contains_key(&container) {
-            return Err(StateError::ContainerNotFound);
+        if !room.buckets.contains_key(&bucket_id) {
+            return Err(StateError::BucketNotFound);
         }
 
         room.room_counter += 1;
         let key_version = room.room_counter;
-        let container_map = room.containers.get_mut(&container).unwrap();
-        container_map.insert(
+        let bucket_map = room.buckets.get_mut(&bucket_id).unwrap();
+        bucket_map.insert(
             key,
             FragmentEntry {
                 value: Value::Null,
@@ -373,7 +394,7 @@ impl AppState {
     pub fn get_fragment(
         &self,
         room_id: u64,
-        container: &str,
+        bucket_id: u64,
         key: &str,
     ) -> Result<(Value, u64), StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
@@ -381,11 +402,11 @@ impl AppState {
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
         }
-        let container_map = room
-            .containers
-            .get(container)
-            .ok_or(StateError::ContainerNotFound)?;
-        let fragment = container_map.get(key).ok_or(StateError::FragmentNotFound)?;
+        let bucket_map = room
+            .buckets
+            .get(&bucket_id)
+            .ok_or(StateError::BucketNotFound)?;
+        let fragment = bucket_map.get(key).ok_or(StateError::FragmentNotFound)?;
 
         if fragment.value.is_null() {
             return Err(StateError::FragmentTombstone);
@@ -398,7 +419,7 @@ impl AppState {
     pub fn get_fragment_persisted(
         &self,
         room_id: u64,
-        container: &str,
+        bucket_id: u64,
         key: &str,
     ) -> Result<bool, StateError> {
         let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
@@ -406,11 +427,11 @@ impl AppState {
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
         }
-        let container_map = room
-            .containers
-            .get(container)
-            .ok_or(StateError::ContainerNotFound)?;
-        let fragment = container_map.get(key).ok_or(StateError::FragmentNotFound)?;
+        let bucket_map = room
+            .buckets
+            .get(&bucket_id)
+            .ok_or(StateError::BucketNotFound)?;
+        let fragment = bucket_map.get(key).ok_or(StateError::FragmentNotFound)?;
         Ok(fragment.persisted)
     }
 
@@ -418,7 +439,7 @@ impl AppState {
     pub fn set_fragment_persisted(
         &self,
         room_id: u64,
-        container: String,
+        bucket_id: u64,
         key: String,
         persisted: bool,
     ) -> Result<(), StateError> {
@@ -427,11 +448,13 @@ impl AppState {
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
         }
-        let container_map = room
-            .containers
-            .get_mut(&container)
-            .ok_or(StateError::ContainerNotFound)?;
-        let entry = container_map.get_mut(&key).ok_or(StateError::FragmentNotFound)?;
+        let bucket_map = room
+            .buckets
+            .get_mut(&bucket_id)
+            .ok_or(StateError::BucketNotFound)?;
+        let entry = bucket_map
+            .get_mut(&key)
+            .ok_or(StateError::FragmentNotFound)?;
         entry.persisted = persisted;
         Ok(())
     }
@@ -461,8 +484,8 @@ impl AppState {
             return Err(StateError::RoomIoBusy);
         }
 
-        let container_count = room.containers.len();
-        let fragment_count: usize = room.containers.values().map(|c| c.len()).sum();
+        let container_count = room.buckets.len();
+        let fragment_count: usize = room.buckets.values().map(|c| c.len()).sum();
 
         Ok(serde_json::json!({
             "room_id": room_id,
@@ -534,6 +557,64 @@ impl AppState {
         self.save_dir = PathBuf::from(dir);
     }
 
+    /// Set the bitflags for a bucket in a room. Replaces existing flags.
+    pub fn set_bucket_flags(
+        &self,
+        room_id: u64,
+        bucket_id: u64,
+        flags: u32,
+    ) -> Result<(), StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+        if !room.buckets.contains_key(&bucket_id) {
+            return Err(StateError::BucketNotFound);
+        }
+        room.bucket_flags.insert(bucket_id, flags);
+        Ok(())
+    }
+
+    /// Get the bitflags for a bucket in a room. Returns 0 if not set.
+    pub fn get_bucket_flags(&self, room_id: u64, bucket_id: u64) -> Result<u32, StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+        if !room.buckets.contains_key(&bucket_id) {
+            return Err(StateError::BucketNotFound);
+        }
+        Ok(*room.bucket_flags.get(&bucket_id).unwrap_or(&0u32))
+    }
+
+    /// Set or clear a single flag bit for a bucket.
+    pub fn set_bucket_flag_bit(
+        &self,
+        room_id: u64,
+        bucket_id: u64,
+        flag_mask: u32,
+        enabled: bool,
+    ) -> Result<(), StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+        if !room.buckets.contains_key(&bucket_id) {
+            return Err(StateError::BucketNotFound);
+        }
+        let current = room.bucket_flags.get(&bucket_id).copied().unwrap_or(0u32);
+        let new = if enabled {
+            current | flag_mask
+        } else {
+            current & !flag_mask
+        };
+        room.bucket_flags.insert(bucket_id, new);
+        Ok(())
+    }
+
     /// Generate a JWT for a room with granted containers.
     pub fn create_room_token(
         &mut self,
@@ -563,7 +644,7 @@ impl AppState {
         // Reject attempts to include reserved server-only container in JWT grants.
         for c in containers.iter() {
             if c == "server_only" {
-                return Err(StateError::ReservedContainerName);
+                return Err(StateError::ReservedBucketId);
             }
         }
 
@@ -637,22 +718,29 @@ impl AppState {
         for op in buffer.drain(..) {
             match op {
                 RoomCommand::Set {
-                    container,
+                    bucket_id,
                     key,
                     value,
                 } => {
                     room.room_counter += 1;
                     let key_version = room.room_counter;
-                    let container_map = room.containers.entry(container).or_default();
-                    container_map.insert(key, FragmentEntry { value, key_version, persisted: false });
+                    let bucket_map = room.buckets.entry(bucket_id).or_default();
+                    bucket_map.insert(
+                        key,
+                        FragmentEntry {
+                            value,
+                            key_version,
+                            persisted: false,
+                        },
+                    );
                 }
-                RoomCommand::Del { container, key } => {
+                RoomCommand::Del { bucket_id, key } => {
                     // For semantics, DEL in a transaction always tombstones the key, even if it did
                     // not previously exist, so consumers can distinguish missing-vs-deleted state.
                     room.room_counter += 1;
                     let key_version = room.room_counter;
-                    let container_map = room.containers.entry(container).or_default();
-                    container_map.insert(
+                    let bucket_map = room.buckets.entry(bucket_id).or_default();
+                    bucket_map.insert(
                         key,
                         FragmentEntry {
                             value: Value::Null,
@@ -678,39 +766,37 @@ impl AppState {
         Ok(())
     }
 
-    /// Get a snapshot of room state for allowed containers.
+    /// Get a snapshot of room state for allowed buckets.
     pub fn room_snapshot(
         &self,
         room_id: u64,
-        allowed_containers: &std::collections::HashSet<String>,
+        allowed_buckets: &std::collections::HashSet<u64>,
     ) -> Option<serde_json::Value> {
         let room_arc = self.rooms.get(&room_id)?;
         let room = room_arc.read().ok()?;
-        let mut containers_json = serde_json::Map::new();
+        let mut buckets_json = serde_json::Map::new();
 
-        for (container_name, fragments) in &room.containers {
-            // Never expose the server-only container to clients.
-            if container_name == "server_only" {
+        for (bucket_id, fragments) in &room.buckets {
+            // Never expose the server-only bucket to clients.
+            if *bucket_id == SERVER_ONLY_BUCKET_ID {
                 continue;
             }
 
-            if container_name == "public" || allowed_containers.contains(container_name) {
-                let mut container_map = serde_json::Map::new();
+            if *bucket_id == 0 || allowed_buckets.contains(bucket_id) {
+                let mut bucket_map = serde_json::Map::new();
                 for (key, entry) in fragments {
                     if !entry.value.is_null() {
-                        container_map.insert(key.clone(), entry.value.clone());
+                        bucket_map.insert(key.clone(), entry.value.clone());
                     }
                 }
-                containers_json.insert(
-                    container_name.clone(),
-                    serde_json::Value::Object(container_map),
-                );
+                let bucket_name = format!("bucket_{}", bucket_id);
+                buckets_json.insert(bucket_name, serde_json::Value::Object(bucket_map));
             }
         }
 
         Some(serde_json::json!({
             "room_counter": room.room_counter,
-            "containers": serde_json::Value::Object(containers_json),
+            "buckets": serde_json::Value::Object(buckets_json),
         }))
     }
 
@@ -720,47 +806,45 @@ impl AppState {
         &self,
         room_id: u64,
         since: u64,
-        allowed_containers: &std::collections::HashSet<String>,
+        allowed_buckets: &std::collections::HashSet<u64>,
     ) -> Option<serde_json::Value> {
         let room_arc = self.rooms.get(&room_id)?;
         let room = room_arc.read().ok()?;
         if since >= room.room_counter {
             return Some(serde_json::json!({
                 "room_counter": room.room_counter,
-                "containers": serde_json::Value::Object(serde_json::Map::new()),
+                "buckets": serde_json::Value::Object(serde_json::Map::new()),
             }));
         }
 
-        let mut containers_json = serde_json::Map::new();
+        let mut buckets_json = serde_json::Map::new();
 
-        for (container_name, fragments) in &room.containers {
-            // Never include server-only container in deltas sent to clients.
-            if container_name == "server_only" {
+        for (bucket_id, fragments) in &room.buckets {
+            // Never include server-only bucket in deltas sent to clients.
+            if *bucket_id == SERVER_ONLY_BUCKET_ID {
                 continue;
             }
 
-            if container_name != "public" && !allowed_containers.contains(container_name) {
+            if *bucket_id != 0 && !allowed_buckets.contains(bucket_id) {
                 continue;
             }
 
-            let mut container_map = serde_json::Map::new();
+            let mut bucket_map = serde_json::Map::new();
             for (key, entry) in fragments {
                 if entry.key_version > since {
-                    container_map.insert(key.clone(), entry.value.clone());
+                    bucket_map.insert(key.clone(), entry.value.clone());
                 }
             }
 
-            if !container_map.is_empty() {
-                containers_json.insert(
-                    container_name.clone(),
-                    serde_json::Value::Object(container_map),
-                );
+            if !bucket_map.is_empty() {
+                let bucket_name = format!("bucket_{}", bucket_id);
+                buckets_json.insert(bucket_name, serde_json::Value::Object(bucket_map));
             }
         }
 
         Some(serde_json::json!({
             "room_counter": room.room_counter,
-            "containers": serde_json::Value::Object(containers_json),
+            "buckets": serde_json::Value::Object(buckets_json),
         }))
     }
 }
@@ -779,19 +863,18 @@ mod tests {
         assert_eq!(room_id, 1);
         assert_eq!(app.room_version(room_id).unwrap(), 0);
 
-        app.set_fragment(room_id, "public".into(), "foo".into(), json!("bar"))
+        app.set_fragment(room_id, 1, "foo".into(), json!("bar"))
             .unwrap();
         assert_eq!(app.room_version(room_id).unwrap(), 1);
 
-        let (value, kv) = app.get_fragment(room_id, "public", "foo").unwrap();
+        let (value, kv) = app.get_fragment(room_id, 1, "foo").unwrap();
         assert_eq!(value, json!("bar"));
         assert_eq!(kv, 1);
 
-        app.del_fragment(room_id, "public".into(), "foo".into())
-            .unwrap();
+        app.del_fragment(room_id, 1, "foo".into()).unwrap();
         assert_eq!(app.room_version(room_id).unwrap(), 2);
 
-        let err = app.get_fragment(room_id, "public", "foo").unwrap_err();
+        let err = app.get_fragment(room_id, 1, "foo").unwrap_err();
         assert!(matches!(err, StateError::FragmentTombstone));
     }
 
@@ -806,31 +889,28 @@ mod tests {
             Err(StateError::TxAlreadyOpen)
         ));
 
-        app.set_fragment(room_id, "public".into(), "a".into(), json!(1))
-            .unwrap();
-        app.del_fragment(room_id, "public".into(), "missing".into())
-            .unwrap();
+        app.set_fragment(room_id, 1, "a".into(), json!(1)).unwrap();
+        app.del_fragment(room_id, 1, "missing".into()).unwrap();
 
         // not applied until tx_end
-        let maybe = app.get_fragment(room_id, "public", "a");
+        let maybe = app.get_fragment(room_id, 1, "a");
         assert!(maybe.is_err());
 
         app.tx_end(room_id).unwrap();
         assert_eq!(app.room_version(room_id).unwrap(), 2);
 
-        let (value, key_version) = app.get_fragment(room_id, "public", "a").unwrap();
+        let (value, key_version) = app.get_fragment(room_id, 1, "a").unwrap();
         assert_eq!(value, json!(1));
         assert_eq!(key_version, 1);
 
-        let err = app.get_fragment(room_id, "public", "missing").unwrap_err();
+        let err = app.get_fragment(room_id, 1, "missing").unwrap_err();
         assert!(matches!(err, StateError::FragmentTombstone));
 
         app.tx_begin(room_id).unwrap();
-        app.set_fragment(room_id, "public".into(), "a".into(), json!(2))
-            .unwrap();
+        app.set_fragment(room_id, 1, "a".into(), json!(2)).unwrap();
         app.tx_abort(room_id).unwrap();
 
-        let (value, kv) = app.get_fragment(room_id, "public", "a").unwrap();
+        let (value, kv) = app.get_fragment(room_id, 1, "a").unwrap();
         assert_eq!(value, json!(1));
         assert_eq!(kv, 1);
     }
@@ -880,12 +960,9 @@ mod tests {
         let mut app = AppState::new();
         let room_id = app.create_room();
 
-        app.set_fragment(room_id, "public".into(), "k1".into(), json!(1))
-            .unwrap();
-        app.set_fragment(room_id, "public".into(), "k2".into(), json!(2))
-            .unwrap();
-        app.set_fragment(room_id, "private".into(), "k3".into(), json!(3))
-            .unwrap();
+        app.set_fragment(room_id, 0, "k1".into(), json!(1)).unwrap();
+        app.set_fragment(room_id, 0, "k2".into(), json!(2)).unwrap();
+        app.set_fragment(room_id, 1, "k3".into(), json!(3)).unwrap();
 
         let info = app.room_info(room_id).unwrap();
         assert_eq!(info["room_id"], json!(room_id));
@@ -924,23 +1001,26 @@ mod tests {
         let mut app = AppState::new();
         let room_id = app.create_room();
 
-        app.set_fragment(room_id, "public".into(), "a".into(), json!(1))
-            .unwrap();
-        app.set_fragment(room_id, "public".into(), "b".into(), json!(2))
-            .unwrap();
-        app.del_fragment(room_id, "public".into(), "a".into())
-            .unwrap(); // tombstone
+        app.set_fragment(room_id, 0, "a".into(), json!(1)).unwrap();
+        app.set_fragment(room_id, 0, "b".into(), json!(2)).unwrap();
+        app.del_fragment(room_id, 0, "a".into()).unwrap(); // tombstone
 
-        app.set_fragment(room_id, "secret".into(), "s".into(), json!("hidden"))
+        app.set_fragment(room_id, 1, "s".into(), json!("hidden"))
             .unwrap();
 
-        let allowed: HashSet<String> = HashSet::new(); // only public
+        let allowed: HashSet<u64> = HashSet::new(); // only public
         let snap = app.room_snapshot(room_id, &allowed).unwrap();
 
-        let containers = snap["containers"].as_object().unwrap();
-        assert_eq!(containers["public"]["b"], json!(2));
-        assert!(containers["public"].get("a").is_none(), "tombstoned key must be excluded");
-        assert!(containers.get("secret").is_none(), "disallowed container must be excluded");
+        let buckets = snap["buckets"].as_object().unwrap();
+        assert_eq!(buckets["bucket_0"]["b"], json!(2));
+        assert!(
+            buckets["bucket_0"].get("a").is_none(),
+            "tombstoned key must be excluded"
+        );
+        assert!(
+            buckets.get("bucket_1").is_none(),
+            "disallowed bucket must be excluded"
+        );
 
         // Non-existent room returns None
         assert!(app.room_snapshot(999, &allowed).is_none());
@@ -950,42 +1030,43 @@ mod tests {
     fn test_room_snapshot_allowed_extra_container() {
         let mut app = AppState::new();
         let room_id = app.create_room();
-        app.set_fragment(room_id, "priv".into(), "x".into(), json!(42))
-            .unwrap();
+        app.set_fragment(room_id, 1, "x".into(), json!(42)).unwrap();
 
-        let mut allowed: HashSet<String> = HashSet::new();
-        allowed.insert("priv".to_string());
+        let mut allowed: HashSet<u64> = HashSet::new();
+        allowed.insert(1u64);
 
         let snap = app.room_snapshot(room_id, &allowed).unwrap();
-        assert_eq!(snap["containers"]["priv"]["x"], json!(42));
+        assert_eq!(snap["buckets"]["bucket_1"]["x"], json!(42));
     }
 
     #[test]
     fn test_room_delta_up_to_date_returns_empty() {
         let mut app = AppState::new();
         let room_id = app.create_room();
-        app.set_fragment(room_id, "public".into(), "k".into(), json!(1))
-            .unwrap();
+        app.set_fragment(room_id, 1, "k".into(), json!(1)).unwrap();
 
-        let allowed: HashSet<String> = HashSet::new();
+        let allowed: HashSet<u64> = HashSet::new();
         let delta = app.room_delta(room_id, 1, &allowed).unwrap();
-        let containers = delta["containers"].as_object().unwrap();
-        assert!(containers.is_empty(), "delta since current version must be empty");
+        let buckets = delta["buckets"].as_object().unwrap();
+        assert!(
+            buckets.is_empty(),
+            "delta since current version must be empty"
+        );
     }
 
     #[test]
     fn test_room_delta_only_new_keys() {
         let mut app = AppState::new();
         let room_id = app.create_room();
-        app.set_fragment(room_id, "public".into(), "old".into(), json!(1))
+        app.set_fragment(room_id, 0, "old".into(), json!(1))
             .unwrap(); // version 1
-        app.set_fragment(room_id, "public".into(), "new".into(), json!(2))
+        app.set_fragment(room_id, 0, "new".into(), json!(2))
             .unwrap(); // version 2
 
-        let allowed: HashSet<String> = HashSet::new();
+        let allowed: HashSet<u64> = HashSet::new();
         // Ask for delta since version 1: should only see "new"
         let delta = app.room_delta(room_id, 1, &allowed).unwrap();
-        let pub_container = &delta["containers"]["public"];
+        let pub_container = &delta["buckets"]["bucket_0"];
         assert_eq!(pub_container["new"], json!(2));
         assert!(pub_container.get("old").is_none());
     }
@@ -993,38 +1074,40 @@ mod tests {
     #[test]
     fn test_room_delta_none_for_missing_room() {
         let app = AppState::new();
-        let allowed: HashSet<String> = HashSet::new();
+        let allowed: HashSet<u64> = HashSet::new();
         assert!(app.room_delta(999, 0, &allowed).is_none());
     }
 
     #[test]
     fn test_room_version_missing_room() {
         let app = AppState::new();
-        assert!(matches!(app.room_version(42), Err(StateError::RoomNotFound)));
+        assert!(matches!(
+            app.room_version(42),
+            Err(StateError::RoomNotFound)
+        ));
     }
 
     #[test]
     fn test_get_fragment_missing_container() {
         let mut app = AppState::new();
         let room_id = app.create_room();
-        let err = app.get_fragment(room_id, "no_such_container", "key").unwrap_err();
-        assert!(matches!(err, StateError::ContainerNotFound));
+        let err = app.get_fragment(room_id, 99, "key").unwrap_err();
+        assert!(matches!(err, StateError::BucketNotFound));
     }
 
     #[test]
     fn test_get_fragment_missing_key() {
         let mut app = AppState::new();
         let room_id = app.create_room();
-        app.set_fragment(room_id, "public".into(), "x".into(), json!(1))
-            .unwrap();
-        let err = app.get_fragment(room_id, "public", "no_key").unwrap_err();
+        app.set_fragment(room_id, 0, "x".into(), json!(1)).unwrap();
+        let err = app.get_fragment(room_id, 0, "no_key").unwrap_err();
         assert!(matches!(err, StateError::FragmentNotFound));
     }
 
     #[test]
     fn test_del_fragment_missing_room() {
         let app = AppState::new();
-        let err = app.del_fragment(99, "public".into(), "k".into()).unwrap_err();
+        let err = app.del_fragment(99, 0, "k".into()).unwrap_err();
         assert!(matches!(err, StateError::RoomNotFound));
     }
 
@@ -1032,10 +1115,8 @@ mod tests {
     fn test_del_fragment_missing_container() {
         let mut app = AppState::new();
         let room_id = app.create_room();
-        let err = app
-            .del_fragment(room_id, "no_such_container".into(), "k".into())
-            .unwrap_err();
-        assert!(matches!(err, StateError::ContainerNotFound));
+        let err = app.del_fragment(room_id, 99, "k".into()).unwrap_err();
+        assert!(matches!(err, StateError::BucketNotFound));
     }
 
     #[test]
@@ -1130,13 +1211,16 @@ mod tests {
     fn test_state_error_display() {
         let cases = vec![
             (StateError::RoomNotFound, "room_not_found"),
-            (StateError::ContainerNotFound, "container_not_found"),
+            (StateError::BucketNotFound, "bucket_not_found"),
             (StateError::FragmentNotFound, "not_found"),
             (StateError::FragmentTombstone, "tombstone"),
             (StateError::TxNotOpen, "tx_not_open"),
             (StateError::TxAlreadyOpen, "tx_already_open"),
             (StateError::JwtKeyNotConfigured, "jwt_key_not_configured"),
-            (StateError::JwtIssuerAudienceNotConfigured, "jwt_issuer_audience_not_configured"),
+            (
+                StateError::JwtIssuerAudienceNotConfigured,
+                "jwt_issuer_audience_not_configured",
+            ),
             (StateError::JwtKeyTooShort, "jwt_key_too_short"),
             (StateError::CommandApiKeyInvalid, "command_api_key_invalid"),
             (StateError::LabelNotFound, "label_not_found"),

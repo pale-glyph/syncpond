@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 type UpdateTransmitFn = Box<dyn Fn(&[u8]) + Send + Sync>;
 
+#[derive(Debug, Clone, Copy)]
 pub struct FragmentFlags(u16);
 
 impl FragmentFlags {

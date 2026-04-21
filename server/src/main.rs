@@ -6,21 +6,25 @@
 //! - Command API key and JWT signing keys must be provisioned securely and rotated out of band.
 #![deny(missing_docs)]
 
-mod rate_limiter;
-mod state;
+mod command;
 mod downstream;
 mod kernel;
-mod command;
+mod persistance;
+mod rate_limiter;
+mod state;
 mod upstream;
 
+use crate::downstream::hub::ClientMessage;
+use crate::downstream::connection::handle_ws_connection;
+use crate::downstream::hub::{DataUpdate, WsHub};
+use crate::kernel::KernelSignal;
 use crate::rate_limiter::RateLimiter;
 use crate::state::{AppState, SharedState};
-use crate::downstream::ws::{WsHub, handle_ws_connection};
 use anyhow::{Context, Result};
-use include_dir::{Dir, include_dir};
+use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use std::{fs, net::SocketAddr, path::Path, sync::Arc};
- 
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
@@ -55,7 +59,9 @@ async fn main() -> Result<()> {
     let log_env = std::env::var("SYNCPOND_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt().with_env_filter(log_env.clone()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(log_env.clone())
+        .init();
     info!(%log_env, "logging initialized");
 
     let config_path =
@@ -86,15 +92,72 @@ async fn main() -> Result<()> {
         _ => anyhow::bail!("save_dir must be configured and non-empty"),
     }
 
+    // Ensure save directory exists for per-room RocksDB instances.
+    fs::create_dir_all(&base_state.save_dir).context("failed to create save_dir")?;
+    info!(path = %base_state.save_dir.display(), "save_dir ready for per-room RocksDBs");
+
+    // Initialize persistence manager and attempt to open existing room DBs.
+    let persistence = std::sync::Arc::new(crate::persistance::PersistenceManager::new(
+        base_state.save_dir.clone(),
+    ));
+    persistence.open_existing_room_dbs().ok();
+
+    // Populate in-memory rooms for any existing room DBs and load bucket flags.
+    let existing_rooms = persistence.list_room_ids();
+    if !existing_rooms.is_empty() {
+        for room_id in &existing_rooms {
+            let buckets = match persistence.room(*room_id) {
+                Some(rp) => rp.load_buckets().unwrap_or_default(),
+                None => std::collections::HashMap::new(),
+            };
+            let mut buckets_map = std::collections::HashMap::new();
+            let mut bucket_labels = std::collections::HashMap::new();
+            let mut bucket_flags = std::collections::HashMap::new();
+            for (id, rec) in buckets {
+                buckets_map.insert(id, std::collections::HashMap::new());
+                if let Some(lbl) = rec.label {
+                    bucket_labels.insert(id, lbl);
+                }
+                bucket_flags.insert(id, rec.flags);
+            }
+            base_state.rooms.insert(
+                *room_id,
+                Arc::new(std::sync::RwLock::new(crate::state::RoomState {
+                    buckets: buckets_map,
+                    room_counter: 0,
+                    tx_buffer: None,
+                    io_locked: false,
+                    bucket_labels,
+                    bucket_flags,
+                })),
+            );
+        }
+        // ensure next_room_id is greater than any existing room id
+        if let Some(max_id) = existing_rooms.iter().max().copied() {
+            if base_state.next_room_id <= max_id {
+                base_state.next_room_id = max_id + 1;
+            }
+        }
+    }
+
     let shared_state = Arc::new(RwLock::new(base_state));
 
-    let ws_hub = Arc::new(Mutex::new(WsHub::new()));
+    // Channels for notification, commands (from WS clients -> kernel), and signals (to kernel).
+    let (notification_tx, notification_rx) = tokio::sync::mpsc::channel::<DataUpdate>(1024);
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<ClientMessage>(1024);
+    let (signal_tx, signal_rx) = tokio::sync::mpsc::channel::<KernelSignal>(1024);
+
+    // Inject senders into WsHub so external components can use them.
+    let ws_hub = Arc::new(Mutex::new(WsHub::new(
+        notification_rx,
+        command_tx.clone(),
+        signal_tx.clone(),
+    )));
     let ws_auth_rate_limiter = Arc::new(RateLimiter::new());
     let ws_room_rate_limiter = Arc::new(RateLimiter::new());
 
     let ws_room_rate_limiter_for_ws = ws_room_rate_limiter.clone();
 
-    
     let ws_auth_rate_limit = config
         .ws_auth_rate_limit
         .unwrap_or(DEFAULT_WS_AUTH_RATE_LIMIT);
@@ -114,7 +177,8 @@ async fn main() -> Result<()> {
             .collect()
     });
 
-    
+    // Spawn the forwarder task that reads notifications and forwards to connected WS clients.
+    ws_hub.lock().await.start().await;
 
     if config.command_api_key.trim().is_empty() {
         anyhow::bail!("command_api_key must be configured and non-empty");
@@ -236,15 +300,27 @@ async fn main() -> Result<()> {
         ws_room_rate_limiter.clone(),
         ws_room_rate_limit,
         ws_room_rate_window_secs,
+        persistence.clone(),
     ));
+
+    // Start kernel background processors to handle commands and signals from WS.
+    let kernel_for_cmds = kernel.clone();
+    let kernel_for_signals = kernel.clone();
+    kernel_for_signals.start_signal_processor(signal_rx);
 
     // start upstream gRPC server for trusted application servers
     let grpc_state = shared_state.clone();
     let grpc_addr_for_task = grpc_addr.clone();
     let kernel_for_grpc = kernel.clone();
     let grpc_server = tokio::spawn(async move {
-        info!("syncpond upstream gRPC server listening on {}", grpc_addr_for_task);
-        let server = crate::upstream::GrpcServer::new(crate::upstream::CommandServer::new(kernel_for_grpc), grpc_state);
+        info!(
+            "syncpond upstream gRPC server listening on {}",
+            grpc_addr_for_task
+        );
+        let server = crate::upstream::GrpcServer::new(
+            crate::upstream::CommandServer::new(kernel_for_grpc),
+            grpc_state,
+        );
         server
             .serve(grpc_addr_for_task)
             .await
