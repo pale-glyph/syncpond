@@ -102,10 +102,64 @@ impl SyncpondKernel {
         });
     }
 
-    async fn handle_client_connected(&self, conn_id: u64, _requested_buckets: Vec<u64>) {
-        // Room id is no longer carried by the client connect signal.
-        // The downstream system only needs the requested bucket ids for later authorization.
-        debug!(conn = conn_id, "client connected without room context");
+    async fn handle_client_connected(&self, conn_id: u64, requested_buckets: Vec<u64>) {
+        // Look up the room this connection belongs to from the hub.
+        let room_id = {
+            let hub = self._ws_hub.lock().await;
+            match hub.get_client_room_id(conn_id) {
+                Some(id) => id,
+                None => {
+                    debug!(conn = conn_id, "handle_client_connected: conn not found in hub, skipping initial sync");
+                    return;
+                }
+            }
+        };
+
+        // Collect all non-tombstoned fragments for the requested buckets.
+        let updates: Vec<(u64, String, Value, u64)> = {
+            let app = self.state.read().await;
+            if let Some(room_arc) = app.rooms.get(&room_id) {
+                if let Ok(room) = room_arc.read() {
+                    let mut out: Vec<(u64, String, Value, u64)> = Vec::new();
+                    for &bucket_id in &requested_buckets {
+                        if let Some(bucket_map) = room.buckets.get(&bucket_id) {
+                            for (key, entry) in bucket_map {
+                                if !entry.value.is_null() {
+                                    out.push((bucket_id, key.clone(), entry.value.clone(), entry.key_version));
+                                }
+                            }
+                        }
+                    }
+                    out
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        };
+
+        let fragment_count = updates.len();
+
+        // Transmit each fragment as a targeted notification to this specific client.
+        for (bucket_id, key, value, key_version) in updates {
+            let msg = DataUpdate {
+                bucket_id,
+                key,
+                value: Some(value),
+                bucket_counter: key_version,
+            };
+            if let Err(err) = self
+                .notification_sender
+                .send(UpdateChannelMessage::Targeted { conn_id, msg })
+                .await
+            {
+                error!(conn = conn_id, room = room_id, %err, "initial sync send failed, aborting");
+                return;
+            }
+        }
+
+        info!(conn = conn_id, room = room_id, fragments = fragment_count, "initial sync complete");
     }
 
     /// Execute a command against the kernel/state and return a response.
@@ -235,8 +289,7 @@ impl SyncpondKernel {
                 }
                 CommandResponse::DeleteMemberResponse
             }
-            Commands::WriteFragment(room_id, fragment_id, data) => {
-                let key = fragment_id.to_string();
+            Commands::WriteFragment(room_id, bucket_id, key, data) => {
                 // try to parse payload as JSON, fall back to string
                 let parsed: Value = match serde_json::from_slice(&data) {
                     Ok(v) => v,
@@ -246,8 +299,8 @@ impl SyncpondKernel {
                 // apply state mutation
                 {
                     let app = self.state.write().await;
-                    if let Err(err) = app.set_fragment(room_id, 0, key.clone(), parsed.clone()) {
-                        error!(room = room_id, "set_fragment error: {:?}", err);
+                    if let Err(err) = app.set_fragment(room_id, bucket_id, key.clone(), parsed.clone()) {
+                        error!(room = room_id, bucket = bucket_id, "set_fragment error: {:?}", err);
                     }
                 }
 
@@ -260,22 +313,22 @@ impl SyncpondKernel {
                     };
                     let _ = self.persistence.open_room_db(room_id);
                     if let Some(rp) = self.persistence.room(room_id) {
-                        if let Err(e) = rp.persist_fragment("public", &key, fragment_val_opt) {
-                            error!(%e, room = room_id, key = %key, "persistence persist_fragment failed");
+                        if let Err(e) = rp.persist_fragment(&bucket_id.to_string(), &key, fragment_val_opt) {
+                            error!(%e, room = room_id, bucket = bucket_id, key = %key, "persistence persist_fragment failed");
                         }
                     } else {
                         error!(room = room_id, "no persistence available for room");
                     }
                 }
 
-                // broadcast update to WS clients
+                // broadcast update to downstream clients subscribed to this bucket
                 let room_counter = {
                     let app = self.state.read().await;
                     app.room_version(room_id).unwrap_or(0)
                 };
 
                 let update = DataUpdate {
-                    bucket_id: 0u64,
+                    bucket_id,
                     key: key.clone(),
                     value: Some(parsed),
                     bucket_counter: room_counter,
@@ -285,7 +338,7 @@ impl SyncpondKernel {
                     .notification_sender
                     .try_send(UpdateChannelMessage::Broadcast(update))
                 {
-                    error!(room = room_id, %err, "notification channel send failed, dropping update");
+                    error!(room = room_id, bucket = bucket_id, %err, "notification channel send failed, dropping update");
                 }
 
                 CommandResponse::FragmentWriteResponse
@@ -298,10 +351,9 @@ impl SyncpondKernel {
                 // Flags manipulation not implemented; accept request for now.
                 CommandResponse::SetFragmentFlagsResponse
             }
-            Commands::ReadFragment(room_id, fragment_id) => {
-                let key = fragment_id.to_string();
+            Commands::ReadFragment(room_id, bucket_id, key) => {
                 let app = self.state.read().await;
-                match app.get_fragment(room_id, 0, &key) {
+                match app.get_fragment(room_id, bucket_id, &key) {
                     Ok((val, _kv)) => match serde_json::to_vec(&val) {
                         Ok(vec) => CommandResponse::FragmentReadResponse(Some(vec)),
                         Err(_) => CommandResponse::FragmentReadResponse(None),

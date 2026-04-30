@@ -21,9 +21,9 @@ pub enum Commands {
     DeleteMember(RoomId, String),
 
     // Fragment handling
-    WriteFragment(RoomId, FragmentId, FragmentData),
+    WriteFragment(RoomId, BucketId, String, FragmentData),
     SetFragmentFlags(RoomId, FragmentId, FragmentFlags),
-    ReadFragment(RoomId, FragmentId),
+    ReadFragment(RoomId, BucketId, String),
     /// Raw message forwarded from a websocket client tied to a room.
     WsMessage(RoomId, Value),
 }

@@ -111,5 +111,22 @@ impl CommandServer {
         Vec::new()
     }
 
+    /// Read a fragment by key from a specific room/bucket. Returns the raw bytes of
+    /// the JSON-serialised value, or `None` if not found.
+    pub async fn read_fragment(&self, room_id: u64, bucket_id: u64, key: String) -> Option<Vec<u8>> {
+        match self.kernel.handle_command(Commands::ReadFragment(room_id, bucket_id, key)).await {
+            CommandResponse::FragmentReadResponse(data) => data,
+            _ => None,
+        }
+    }
+
+    /// Write a fragment to a specific room/bucket and emit a downstream notification.
+    pub async fn write_fragment(&self, room_id: u64, bucket_id: u64, key: String, data: Vec<u8>) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::WriteFragment(room_id, bucket_id, key, data)).await {
+            CommandResponse::FragmentWriteResponse => Ok(()),
+            _ => Err("write_fragment_failed".to_string()),
+        }
+    }
+
     // Room/bucket labels are set only at creation time; label get/set RPCs removed.
 }

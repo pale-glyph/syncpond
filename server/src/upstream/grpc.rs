@@ -152,6 +152,28 @@ impl CommandService for CommandServiceImpl {
         let entries = self.inner.list_buckets(room_id).await;
         Ok(Response::new(proto::ListBucketsResponse { buckets: entries }))
     }
+
+    async fn read_fragment(
+        &self,
+        request: Request<proto::ReadFragmentRequest>,
+    ) -> Result<Response<proto::ReadFragmentResponse>, Status> {
+        let req = request.into_inner();
+        match self.inner.read_fragment(req.room_id, req.bucket_id, req.key).await {
+            Some(data) => Ok(Response::new(proto::ReadFragmentResponse { data, found: true })),
+            None => Ok(Response::new(proto::ReadFragmentResponse { data: vec![], found: false })),
+        }
+    }
+
+    async fn write_fragment(
+        &self,
+        request: Request<proto::WriteFragmentRequest>,
+    ) -> Result<Response<proto::WriteFragmentResponse>, Status> {
+        let req = request.into_inner();
+        match self.inner.write_fragment(req.room_id, req.bucket_id, req.key, req.data).await {
+            Ok(()) => Ok(Response::new(proto::WriteFragmentResponse {})),
+            Err(e) => Err(Status::internal(e)),
+        }
+    }
 }
 
 /// A small gRPC server wrapper around the upstream `CommandServer`.

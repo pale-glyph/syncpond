@@ -32,6 +32,12 @@ message ListMembersResponse { repeated string members = 1; }
 message ListBucketsRequest { uint64 room_id = 1; }
 message ListBucketsResponse { repeated string buckets = 1; }
 
+message ReadFragmentRequest { uint64 room_id = 1; uint64 bucket_id = 2; string key = 3; }
+message ReadFragmentResponse { bytes data = 1; bool found = 2; }
+
+message WriteFragmentRequest { uint64 room_id = 1; uint64 bucket_id = 2; string key = 3; bytes data = 4; }
+message WriteFragmentResponse {}
+
 // Room/bucket labels are set at creation time; no separate get/set RPCs.
 
 service CommandService {
@@ -45,4 +51,6 @@ service CommandService {
   rpc NewMember (NewMemberRequest) returns (NewMemberResponse);
   rpc DeleteMember (DeleteMemberRequest) returns (DeleteMemberResponse);
   rpc ListMembers (ListMembersRequest) returns (ListMembersResponse);
+  rpc ReadFragment (ReadFragmentRequest) returns (ReadFragmentResponse);
+  rpc WriteFragment (WriteFragmentRequest) returns (WriteFragmentResponse);
 }
