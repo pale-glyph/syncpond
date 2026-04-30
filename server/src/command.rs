@@ -1,10 +1,8 @@
-use crate::state::rooms::FragmentFlags;
 use serde_json::Value;
 
 pub type RoomName = String;
 pub type RoomId = u64;
 pub type BucketId = u64;
-pub type FragmentId = u64;
 pub type FragmentData = Vec<u8>;
 
 /// Commands that can be executed against the kernel/state.
@@ -12,8 +10,6 @@ pub type FragmentData = Vec<u8>;
 pub enum Commands {
     // Room handling
     NewRoom(RoomName),
-    CloseRoom(RoomId),
-
     // Bucket handling
     NewBucket(RoomId, BucketId, String),
     DeleteBucket(RoomId, BucketId),
@@ -22,7 +18,6 @@ pub enum Commands {
 
     // Fragment handling
     WriteFragment(RoomId, BucketId, String, FragmentData),
-    SetFragmentFlags(RoomId, FragmentId, FragmentFlags),
     ReadFragment(RoomId, BucketId, String),
     // Load/unload room
     LoadRoom(RoomId),
@@ -36,7 +31,6 @@ pub enum Commands {
 pub enum CommandResponse {
     // Room handling responses
     NewRoomResponse(RoomId),
-    CloseRoomResponse,
 
     // Bucket handling responses
     NewBucketResponse,
@@ -46,7 +40,6 @@ pub enum CommandResponse {
 
     // Fragment handling responses
     FragmentWriteResponse,
-    SetFragmentFlagsResponse,
     FragmentReadResponse(Option<FragmentData>),
     /// Room load/unload responses
     LoadRoomResponse(Result<(), String>),

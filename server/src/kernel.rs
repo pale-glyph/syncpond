@@ -15,8 +15,6 @@ use tracing::{debug, error, info};
 /// Signals that can be sent to the kernel from other components.
 #[derive(Debug)]
 pub enum KernelSignal {
-    Shutdown,
-    Custom(String),
     ClientConnected {
         conn_id: u64,
         requested_buckets: Vec<u64>,
@@ -24,12 +22,6 @@ pub enum KernelSignal {
     ClientDisconnected {
         conn_id: u64,
     },
-}
-
-impl KernelSignal {
-    pub fn ws_connected(room_id: u64, client_id: u64) -> Self {
-        KernelSignal::Custom(format!("ws_connected:{}:{}", room_id, client_id))
-    }
 }
 
 /// The SyncpondKernel coordinates persistence (`state`) and downstream
@@ -76,12 +68,6 @@ impl SyncpondKernel {
         tokio::spawn(async move {
             while let Some(sig) = rx.recv().await {
                 match sig {
-                    KernelSignal::Shutdown => {
-                        info!("kernel received shutdown signal");
-                    }
-                    KernelSignal::Custom(s) => {
-                        info!(signal = %s, "kernel received custom signal");
-                    }
                     KernelSignal::ClientConnected {
                         conn_id,
                         requested_buckets,
@@ -177,19 +163,6 @@ impl SyncpondKernel {
                 }
                 info!(new_room = room_id, "created new room (loaded, empty)");
                 CommandResponse::NewRoomResponse(room_id)
-            }
-            Commands::CloseRoom(room_id) => {
-                let mut app = self.state.write().await;
-                match app.delete_room(room_id) {
-                    Ok(_) => {
-                        info!(room = room_id, "closed room");
-                        CommandResponse::CloseRoomResponse
-                    }
-                    Err(err) => {
-                        error!(room = room_id, "close room failed: {:?}", err);
-                        CommandResponse::CloseRoomResponse
-                    }
-                }
             }
             Commands::NewBucket(room_id, bucket_id, label) => {
                 // Create a named container for the given bucket id and set optional label.
@@ -343,10 +316,6 @@ impl SyncpondKernel {
             Commands::WsMessage(room_id, msg) => {
                 debug!(room = room_id, message = ?msg, "kernel received WS message forwarded as command");
                 CommandResponse::WsMessageAck
-            }
-            Commands::SetFragmentFlags(_room_id, _fragment_id, _flags) => {
-                // Flags manipulation not implemented; accept request for now.
-                CommandResponse::SetFragmentFlagsResponse
             }
             Commands::ReadFragment(room_id, bucket_id, key) => {
                 let app = self.state.read().await;

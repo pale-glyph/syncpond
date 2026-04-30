@@ -1,5 +1,4 @@
-pub mod rooms;
-
+#![allow(dead_code)]
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 /// Bucket flag bits indicating metadata for a bucket.
@@ -19,22 +18,10 @@ pub type SharedState = Arc<RwLock<AppState>>;
 /// Reserved bucket id for server-only data within state module.
 pub const SERVER_ONLY_BUCKET_ID: u64 = u64::MAX;
 
-/// Event produced when a room's data changes that should be broadcast to WS clients.
-#[derive(Debug, Clone)]
-pub struct RoomUpdate {
-    pub room_id: u64,
-    pub container: String,
-    pub key: String,
-    pub value: Option<serde_json::Value>,
-    pub room_counter: u64,
-}
-
 #[derive(Debug)]
 pub struct FragmentEntry {
     pub value: Value,
     pub key_version: u64,
-    /// `true` once this fragment has been written to disk via SAVE.
-    pub persisted: bool,
 }
 
 #[derive(Debug)]
@@ -273,7 +260,7 @@ impl AppState {
             let frag_map = fragments.get(id).cloned().unwrap_or_default();
             let entry_map: HashMap<String, FragmentEntry> = frag_map
                 .into_iter()
-                .map(|(key, val)| (key, FragmentEntry { value: val, key_version: 0, persisted: true }))
+                .map(|(key, val)| (key, FragmentEntry { value: val, key_version: 0 }))
                 .collect();
             room.buckets.insert(*id, entry_map);
         }
@@ -472,7 +459,6 @@ impl AppState {
             FragmentEntry {
                 value,
                 key_version,
-                persisted: false,
             },
         );
 
@@ -512,7 +498,6 @@ impl AppState {
             FragmentEntry {
                 value: Value::Null,
                 key_version,
-                persisted: false,
             },
         );
         Ok(())
@@ -544,50 +529,6 @@ impl AppState {
         }
 
         Ok((fragment.value.clone(), fragment.key_version))
-    }
-
-    /// Get whether a fragment has been persisted to disk via SAVE.
-    pub fn get_fragment_persisted(
-        &self,
-        room_id: u64,
-        bucket_id: u64,
-        key: &str,
-    ) -> Result<bool, StateError> {
-        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
-        let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
-        if room.io_locked {
-            return Err(StateError::RoomIoBusy);
-        }
-        let bucket_map = room
-            .buckets
-            .get(&bucket_id)
-            .ok_or(StateError::BucketNotFound)?;
-        let fragment = bucket_map.get(key).ok_or(StateError::FragmentNotFound)?;
-        Ok(fragment.persisted)
-    }
-
-    /// Set or unset the persisted flag for a fragment. Returns error if room/container/key missing.
-    pub fn set_fragment_persisted(
-        &self,
-        room_id: u64,
-        bucket_id: u64,
-        key: String,
-        persisted: bool,
-    ) -> Result<(), StateError> {
-        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
-        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
-        if room.io_locked {
-            return Err(StateError::RoomIoBusy);
-        }
-        let bucket_map = room
-            .buckets
-            .get_mut(&bucket_id)
-            .ok_or(StateError::BucketNotFound)?;
-        let entry = bucket_map
-            .get_mut(&key)
-            .ok_or(StateError::FragmentNotFound)?;
-        entry.persisted = persisted;
-        Ok(())
     }
 
     /// Get the room version counter for the specified room.
@@ -870,7 +811,6 @@ impl AppState {
                         FragmentEntry {
                             value,
                             key_version,
-                            persisted: false,
                         },
                     );
                 }
@@ -885,7 +825,6 @@ impl AppState {
                         FragmentEntry {
                             value: Value::Null,
                             key_version,
-                            persisted: false,
                         },
                     );
                 }
