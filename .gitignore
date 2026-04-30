@@ -27,3 +27,4 @@ target
 /target
 node_modules
 coverage
+/data

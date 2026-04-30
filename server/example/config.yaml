@@ -19,4 +19,4 @@ health_bind_loopback_only: true
 # Persistence — required. The server will fail fast if path is missing or
 # inaccessible. Set sync_on_write: true for strict durability (lower
 # throughput); omit or set false for background flushing (higher throughput).
-save_dir: "/var/lib/syncpond"
+save_dir: "/home/debian/code/syncpond/data"
