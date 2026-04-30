@@ -14,11 +14,20 @@ message DeleteRoomResponse {}
 message IssueJwtRequest { uint64 room_id = 1; string sub = 2; repeated uint64 buckets = 3; }
 message IssueJwtResponse { string jwt = 1; }
 
-message CreateBucketRequest { uint64 room_id = 1; uint64 bucket_id = 2; string label = 3; }
-message CreateBucketResponse {}
+message NewBucketRequest { uint64 room_id = 1; uint64 bucket_id = 2; string label = 3; }
+message NewBucketResponse {}
 
 message DeleteBucketRequest { uint64 room_id = 1; uint64 bucket_id = 2; }
 message DeleteBucketResponse {}
+
+message NewMemberRequest { uint64 room_id = 1; string member = 2; }
+message NewMemberResponse {}
+
+message DeleteMemberRequest { uint64 room_id = 1; string member = 2; }
+message DeleteMemberResponse {}
+
+message ListMembersRequest { uint64 room_id = 1; }
+message ListMembersResponse { repeated string members = 1; }
 
 message ListBucketsRequest { uint64 room_id = 1; }
 message ListBucketsResponse { repeated string buckets = 1; }
@@ -30,7 +39,10 @@ service CommandService {
   rpc ListRooms (ListRoomsRequest) returns (ListRoomsResponse);
   rpc DeleteRoom (DeleteRoomRequest) returns (DeleteRoomResponse);
   rpc IssueJwt (IssueJwtRequest) returns (IssueJwtResponse);
-  rpc CreateBucket (CreateBucketRequest) returns (CreateBucketResponse);
+  rpc NewBucket (NewBucketRequest) returns (NewBucketResponse);
   rpc DeleteBucket (DeleteBucketRequest) returns (DeleteBucketResponse);
   rpc ListBuckets (ListBucketsRequest) returns (ListBucketsResponse);
+  rpc NewMember (NewMemberRequest) returns (NewMemberResponse);
+  rpc DeleteMember (DeleteMemberRequest) returns (DeleteMemberResponse);
+  rpc ListMembers (ListMembersRequest) returns (ListMembersResponse);
 }

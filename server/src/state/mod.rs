@@ -51,6 +51,8 @@ pub struct RoomState {
     pub bucket_labels: HashMap<u64, String>,
     /// Bitflags for buckets in this room. Keyed by numeric bucket id.
     pub bucket_flags: HashMap<u64, u32>,
+    /// Members in this room. Members are pure strings and are stored uniquely.
+    pub members: std::collections::HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -98,6 +100,9 @@ pub enum StateError {
     /// Bucket id reserved for server-only data; cannot be granted to clients via JWTs.
     ReservedBucketId,
 
+    /// JWT subject is not a valid member of the room.
+    InvalidMember,
+
     /// Command API key is blank/invalid.
     CommandApiKeyInvalid,
     /// Label not found when looking up by name.
@@ -125,6 +130,7 @@ impl std::fmt::Display for StateError {
             }
             StateError::JwtKeyTooShort => write!(f, "jwt_key_too_short"),
             StateError::ReservedBucketId => write!(f, "reserved_bucket_id"),
+            StateError::InvalidMember => write!(f, "invalid_member"),
             StateError::CommandApiKeyInvalid => write!(f, "command_api_key_invalid"),
             StateError::LabelNotFound => write!(f, "label_not_found"),
             StateError::LabelInUse => write!(f, "label_in_use"),
@@ -220,6 +226,7 @@ impl AppState {
                 io_locked: false,
                 bucket_labels: HashMap::new(),
                 bucket_flags: HashMap::new(),
+                members: std::collections::HashSet::new(),
             })),
         );
         room_id
@@ -305,6 +312,50 @@ impl AppState {
         room.bucket_labels
             .insert(bucket_id, label_trimmed.to_string());
         Ok(())
+    }
+
+    /// Add a member string to a room.
+    pub fn add_member(&self, room_id: u64, member: String) -> Result<(), StateError> {
+        let member_trimmed = member.trim();
+        if member_trimmed.is_empty() || member_trimmed.len() > 256 {
+            return Err(StateError::LabelInvalid);
+        }
+
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+
+        room.members.insert(member_trimmed.to_string());
+        Ok(())
+    }
+
+    /// Remove a member string from a room.
+    pub fn remove_member(&self, room_id: u64, member: &str) -> Result<(), StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+
+        if !room.members.remove(member) {
+            return Err(StateError::FragmentNotFound);
+        }
+        Ok(())
+    }
+
+    /// List members in a room.
+    pub fn list_members(&self, room_id: u64) -> Result<Vec<String>, StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
+        if room.io_locked {
+            return Err(StateError::RoomIoBusy);
+        }
+
+        let mut members: Vec<String> = room.members.iter().cloned().collect();
+        members.sort();
+        Ok(members)
     }
 
     /// Get the label for a bucket if present.
@@ -642,6 +693,14 @@ impl AppState {
         if !self.rooms.contains_key(&room_id) {
             return Err(StateError::RoomNotFound);
         }
+
+        let room_arc = self.rooms.get(&room_id).unwrap();
+        let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
+        let sub_trimmed = sub.trim();
+        if sub_trimmed.is_empty() || !room.members.contains(sub_trimmed) {
+            return Err(StateError::InvalidMember);
+        }
+
         // Reject attempts to include reserved server-only bucket in JWT grants.
         for id in buckets.iter() {
             if *id == SERVER_ONLY_BUCKET_ID {
@@ -676,7 +735,7 @@ impl AppState {
         }
 
         let claims = JwtClaims {
-            sub: sub.to_string(),
+            sub: sub_trimmed.to_string(),
             buckets: bucket_set.into_iter().collect(),
             exp: exp as usize,
             iss: self.jwt_issuer.clone(),
@@ -1173,6 +1232,32 @@ mod tests {
         app.set_jwt_audience("aud".to_string());
         let err = app.create_room_token(999, "room:1", &[]).unwrap_err();
         assert!(matches!(err, StateError::RoomNotFound));
+    }
+
+    #[test]
+    fn test_create_room_token_invalid_member() {
+        let mut app = AppState::new();
+        app.set_jwt_key("a_long_enough_secret_key_32bytes_+".to_string());
+        app.set_jwt_issuer("syncpond".to_string());
+        app.set_jwt_audience("client".to_string());
+        let room_id = app.create_room();
+
+        let err = app.create_room_token(room_id, "room:1", &[]).unwrap_err();
+        assert!(matches!(err, StateError::InvalidMember));
+    }
+
+    #[test]
+    fn test_create_room_token_valid_member() {
+        let mut app = AppState::new();
+        app.set_jwt_key("a_long_enough_secret_key_32bytes_+".to_string());
+        app.set_jwt_issuer("syncpond".to_string());
+        app.set_jwt_audience("client".to_string());
+        let room_id = app.create_room();
+        app.add_member(room_id, "room:1".to_string()).unwrap();
+
+        let token = app.create_room_token(room_id, "room:1", &[1u64]).unwrap();
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts");
     }
 
     #[test]

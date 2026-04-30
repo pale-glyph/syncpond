@@ -64,7 +64,7 @@ impl CommandService for CommandServiceImpl {
                 // map known error strings to appropriate gRPC statuses
                 match e.as_str() {
                     "room_not_found" => Err(Status::not_found(e)),
-                    "reserved_bucket_id" => Err(Status::invalid_argument(e)),
+                    "reserved_bucket_id" | "invalid_member" => Err(Status::invalid_argument(e)),
                     "jwt_key_not_configured" | "jwt_key_too_short" | "jwt_issuer_audience_not_configured" => {
                         Err(Status::failed_precondition(e))
                     }
@@ -74,17 +74,17 @@ impl CommandService for CommandServiceImpl {
         }
     }
 
-    async fn create_bucket(
+    async fn new_bucket(
         &self,
-        request: Request<proto::CreateBucketRequest>,
-    ) -> Result<Response<proto::CreateBucketResponse>, Status> {
+        request: Request<proto::NewBucketRequest>,
+    ) -> Result<Response<proto::NewBucketResponse>, Status> {
         let req = request.into_inner();
         let room_id = req.room_id;
         let bucket_id = req.bucket_id;
         let label = req.label;
 
-        match self.inner.create_bucket(room_id, bucket_id, label).await {
-            Ok(()) => Ok(Response::new(proto::CreateBucketResponse {})),
+        match self.inner.new_bucket(room_id, bucket_id, label).await {
+            Ok(()) => Ok(Response::new(proto::NewBucketResponse {})),
             Err(e) => Err(Status::internal(e)),
         }
     }
@@ -101,6 +101,45 @@ impl CommandService for CommandServiceImpl {
             Ok(()) => Ok(Response::new(proto::DeleteBucketResponse {})),
             Err(e) => Err(Status::not_found(e)),
         }
+    }
+
+    async fn new_member(
+        &self,
+        request: Request<proto::NewMemberRequest>,
+    ) -> Result<Response<proto::NewMemberResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+        let member = req.member;
+
+        match self.inner.new_member(room_id, member).await {
+            Ok(()) => Ok(Response::new(proto::NewMemberResponse {})),
+            Err(e) => Err(Status::not_found(e)),
+        }
+    }
+
+    async fn delete_member(
+        &self,
+        request: Request<proto::DeleteMemberRequest>,
+    ) -> Result<Response<proto::DeleteMemberResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+        let member = req.member;
+
+        match self.inner.delete_member(room_id, member).await {
+            Ok(()) => Ok(Response::new(proto::DeleteMemberResponse {})),
+            Err(e) => Err(Status::not_found(e)),
+        }
+    }
+
+    async fn list_members(
+        &self,
+        request: Request<proto::ListMembersRequest>,
+    ) -> Result<Response<proto::ListMembersResponse>, Status> {
+        let req = request.into_inner();
+        let room_id = req.room_id;
+
+        let entries = self.inner.list_members(room_id).await;
+        Ok(Response::new(proto::ListMembersResponse { members: entries }))
     }
 
     async fn list_buckets(

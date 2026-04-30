@@ -5,7 +5,7 @@ use crate::persistance::PersistenceManager;
 use crate::state::SharedState;
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
 };
 use tokio::sync::{mpsc, Mutex};
@@ -19,7 +19,6 @@ pub enum KernelSignal {
     Custom(String),
     ClientConnected {
         conn_id: u64,
-        room_id: u64,
         requested_buckets: Vec<u64>,
     },
     ClientDisconnected {
@@ -85,17 +84,15 @@ impl SyncpondKernel {
                     }
                     KernelSignal::ClientConnected {
                         conn_id,
-                        room_id,
                         requested_buckets,
                     } => {
                         let bucket_count = requested_buckets.len();
                         info!(
                             conn = conn_id,
-                            room = room_id,
                             requested_buckets = bucket_count,
                             "client connected"
                         );
-                        self.send_initial_room_notifications(conn_id, room_id, requested_buckets).await;
+                        self.handle_client_connected(conn_id, requested_buckets).await;
                     }
                     KernelSignal::ClientDisconnected { conn_id } => {
                         info!(conn = conn_id, "client disconnected");
@@ -105,54 +102,10 @@ impl SyncpondKernel {
         });
     }
 
-    async fn send_initial_room_notifications(
-        &self,
-        conn_id: u64,
-        room_id: u64,
-        requested_rooms: Vec<u64>,
-    ) {
-        let allowed_buckets: HashSet<u64> = requested_rooms.into_iter().collect();
-        let snapshot_opt = {
-            let app = self.state.read().await;
-            app.room_snapshot(room_id, &allowed_buckets)
-        };
-
-        if let Some(snapshot) = snapshot_opt {
-            let room_counter = snapshot
-                .get("room_counter")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_default();
-
-            if let Some(buckets) = snapshot.get("buckets").and_then(|v| v.as_object()) {
-                for (bucket_name, bucket_values) in buckets {
-                    if let Some(bucket_id) = bucket_name
-                        .strip_prefix("bucket_")
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        if let Some(bucket_map) = bucket_values.as_object() {
-                            for (key, value) in bucket_map {
-                                let update = DataUpdate {
-                                    bucket_id,
-                                    key: key.clone(),
-                                    value: Some(value.clone()),
-                                    bucket_counter: room_counter,
-                                };
-                                if let Err(err) = self
-                                    .notification_sender
-                                    .send(UpdateChannelMessage::Targeted {
-                                        conn_id,
-                                        msg: update,
-                                    })
-                                    .await
-                                {
-                                    error!(conn = conn_id, %err, "failed to send initial room notification");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    async fn handle_client_connected(&self, conn_id: u64, _requested_buckets: Vec<u64>) {
+        // Room id is no longer carried by the client connect signal.
+        // The downstream system only needs the requested bucket ids for later authorization.
+        debug!(conn = conn_id, "client connected without room context");
     }
 
     /// Execute a command against the kernel/state and return a response.
@@ -201,7 +154,7 @@ impl SyncpondKernel {
                     }
                 }
             }
-            Commands::CreateBucket(room_id, bucket_id, label) => {
+            Commands::NewBucket(room_id, bucket_id, label) => {
                 // Create a named container for the given bucket id and set optional label.
                 let app = self.state.write().await;
                 if let Some(room_arc) = app.rooms.get(&room_id) {
@@ -227,7 +180,7 @@ impl SyncpondKernel {
                         }
                     }
                 }
-                CommandResponse::CreateBucketResponse
+                CommandResponse::NewBucketResponse
             }
             Commands::DeleteBucket(room_id, bucket_id) => {
                 let app = self.state.write().await;
@@ -247,6 +200,40 @@ impl SyncpondKernel {
                     }
                 }
                 CommandResponse::DeleteBucketResponse
+            }
+            Commands::NewMember(room_id, member) => {
+                let member_trimmed = member.trim().to_string();
+                let app = self.state.write().await;
+                if let Some(room_arc) = app.rooms.get(&room_id) {
+                    if let Ok(mut room) = room_arc.write() {
+                        if !member_trimmed.is_empty() {
+                            room.members.insert(member_trimmed.clone());
+                        }
+                    }
+                    let _ = self.persistence.open_room_db(room_id);
+                    if let Some(rp) = self.persistence.room(room_id) {
+                        if let Err(e) = rp.persist_member(&member_trimmed) {
+                            error!(%e, room = room_id, member = %member_trimmed, "failed to persist member");
+                        }
+                    }
+                }
+                CommandResponse::NewMemberResponse
+            }
+            Commands::DeleteMember(room_id, member) => {
+                let member_trimmed = member.trim().to_string();
+                let app = self.state.write().await;
+                if let Some(room_arc) = app.rooms.get(&room_id) {
+                    if let Ok(mut room) = room_arc.write() {
+                        room.members.remove(&member_trimmed);
+                    }
+                    let _ = self.persistence.open_room_db(room_id);
+                    if let Some(rp) = self.persistence.room(room_id) {
+                        if let Err(e) = rp.remove_member(&member_trimmed) {
+                            error!(%e, room = room_id, member = %member_trimmed, "failed to remove member");
+                        }
+                    }
+                }
+                CommandResponse::DeleteMemberResponse
             }
             Commands::WriteFragment(room_id, fragment_id, data) => {
                 let key = fragment_id.to_string();

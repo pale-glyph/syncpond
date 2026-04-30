@@ -113,8 +113,6 @@ pub async fn handle_ws_connection(
             return Ok(());
         }
     };
-    let room_id: u64 = 0;
-
     let _last_seen_counter = auth_msg.last_seen_counter;
 
     let mut allowed_buckets: HashSet<u64> = claims.buckets.unwrap_or_default().into_iter().collect();
@@ -124,7 +122,7 @@ pub async fn handle_ws_connection(
     // No initial snapshot from SharedState here. Kernel will send updates.
     let bucket_count = 0usize;
     let room_counter = 0u64;
-    debug!(%peer, room_id = room_id, bucket_count, "prepared empty room snapshot");
+    debug!(%peer, bucket_count, "prepared empty room snapshot");
 
     let auth_ok = json!({
         "type": "auth_ok",
@@ -132,7 +130,7 @@ pub async fn handle_ws_connection(
         "state": { "room_counter": room_counter, "buckets": {} },
     });
 
-    debug!(%peer, room_id = room_id, "sending auth_ok");
+    debug!(%peer, "sending auth_ok");
     ws_sender.send(Message::Text(auth_ok.to_string())).await?;
 
     let (tx, mut rx) = mpsc::channel::<Value>(MAX_WS_PENDING_MESSAGES);
@@ -140,7 +138,7 @@ pub async fn handle_ws_connection(
     let conn_id = {
         let mut hub = ws_hub.lock().await;
         let conn_id = hub.allocate_connection_id();
-        match hub.add_client(conn_id, room_id, allowed_buckets.clone(), tx.clone()) {
+        match hub.add_client(conn_id, 0, allowed_buckets.clone(), tx.clone()) {
             Ok(()) => conn_id,
             Err(reason) => {
                 let err = json!({"type":"auth_error","reason":reason});
@@ -153,13 +151,12 @@ pub async fn handle_ws_connection(
     signal_sender
         .try_send(KernelSignal::ClientConnected {
             conn_id,
-            room_id,
             requested_buckets: allowed_buckets.iter().cloned().collect(),
         })
         .ok();
 
-    info!(%peer, room_id = room_id, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client added");
-    info!(%peer, room_id = room_id, "ws client authenticated and added");
+    info!(%peer, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client added");
+    info!(%peer, "ws client authenticated and added");
 
     loop {
         tokio::select! {

@@ -50,10 +50,10 @@ impl CommandServer {
     /// Create a bucket for a room. Bucket id is numeric and will be translated
     /// into an internal container name `bucket_<id>`. A label may be provided
     /// and will be stored at creation time for convenience on the client.
-    pub async fn create_bucket(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), String> {
-        match self.kernel.handle_command(Commands::CreateBucket(room_id, bucket_id, label)).await {
-            CommandResponse::CreateBucketResponse => Ok(()),
-            _ => Err("create_bucket_failed".to_string()),
+    pub async fn new_bucket(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::NewBucket(room_id, bucket_id, label)).await {
+            CommandResponse::NewBucketResponse => Ok(()),
+            _ => Err("new_bucket_failed".to_string()),
         }
     }
 
@@ -61,6 +61,28 @@ impl CommandServer {
         match self.kernel.handle_command(Commands::DeleteBucket(room_id, bucket_id)).await {
             CommandResponse::DeleteBucketResponse => Ok(()),
             _ => Err("delete_bucket_failed".to_string()),
+        }
+    }
+
+    pub async fn new_member(&self, room_id: u64, member: String) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::NewMember(room_id, member)).await {
+            CommandResponse::NewMemberResponse => Ok(()),
+            _ => Err("new_member_failed".to_string()),
+        }
+    }
+
+    pub async fn delete_member(&self, room_id: u64, member: String) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::DeleteMember(room_id, member)).await {
+            CommandResponse::DeleteMemberResponse => Ok(()),
+            _ => Err("delete_member_failed".to_string()),
+        }
+    }
+
+    pub async fn list_members(&self, room_id: u64) -> Vec<String> {
+        let app = self.kernel.state.read().await;
+        match app.list_members(room_id) {
+            Ok(members) => members,
+            Err(_) => Vec::new(),
         }
     }
 

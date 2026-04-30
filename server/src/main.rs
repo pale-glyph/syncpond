@@ -107,6 +107,10 @@ async fn main() -> Result<()> {
                 }
                 bucket_flags.insert(id, rec.flags);
             }
+            let members = match persistence.room(*room_id) {
+                Some(rp) => rp.load_members().unwrap_or_default(),
+                None => std::collections::HashSet::new(),
+            };
             base_state.rooms.insert(
                 *room_id,
                 Arc::new(std::sync::RwLock::new(crate::state::RoomState {
@@ -116,6 +120,7 @@ async fn main() -> Result<()> {
                     io_locked: false,
                     bucket_labels,
                     bucket_flags,
+                    members,
                 })),
             );
         }

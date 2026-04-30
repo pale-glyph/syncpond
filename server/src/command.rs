@@ -15,8 +15,10 @@ pub enum Commands {
     CloseRoom(RoomId),
 
     // Bucket handling
-    CreateBucket(RoomId, BucketId, String),
+    NewBucket(RoomId, BucketId, String),
     DeleteBucket(RoomId, BucketId),
+    NewMember(RoomId, String),
+    DeleteMember(RoomId, String),
 
     // Fragment handling
     WriteFragment(RoomId, FragmentId, FragmentData),
@@ -34,8 +36,10 @@ pub enum CommandResponse {
     CloseRoomResponse,
 
     // Bucket handling responses
-    CreateBucketResponse,
+    NewBucketResponse,
     DeleteBucketResponse,
+    NewMemberResponse,
+    DeleteMemberResponse,
 
     // Fragment handling responses
     FragmentWriteResponse,
