@@ -47,6 +47,12 @@ impl PersistenceManager {
 
     /// Open (or create) a RocksDB for a room and store it in the manager.
     pub fn open_room_db(&self, room_id: u64) -> Result<(), String> {
+        {
+            let map = self.dbs.lock().map_err(|_| "persistence mutex poisoned".to_string())?;
+            if map.contains_key(&room_id) {
+                return Ok(());
+            }
+        }
         let path = self.base_path.join(format!("room_{}", room_id));
         std::fs::create_dir_all(&path)
             .map_err(|e| format!("failed to create room db dir {}: {}", path.display(), e))?;
@@ -350,6 +356,39 @@ impl RoomPersistence {
             Ok(None) => Ok(None),
             Err(e) => Err(format!("rocksdb get failed: {}", e)),
         }
+    }
+
+    /// Scan the room DB and return all fragment entries grouped by bucket id.
+    /// Fragment keys have the format `{bucket_id}:{key}` where `bucket_id` is a numeric u64.
+    /// Keys belonging to bucket records, metadata or the room manifest are automatically skipped.
+    pub fn load_all_fragments(&self) -> Result<HashMap<u64, HashMap<String, serde_json::Value>>, String> {
+        let mut out: HashMap<u64, HashMap<String, serde_json::Value>> = HashMap::new();
+        let iter = self.db.iterator(IteratorMode::Start);
+        for item in iter {
+            let (k, v) = item.map_err(|e| format!("rocksdb iterator error: {}", e))?;
+            let kstr = match std::str::from_utf8(&k) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Fragment keys start with a decimal digit (bucket_id) followed by ':'
+            if let Some(colon) = kstr.find(':') {
+                let prefix = &kstr[..colon];
+                if let Ok(bucket_id) = prefix.parse::<u64>() {
+                    let frag_key = &kstr[colon + 1..];
+                    match serde_json::from_slice::<serde_json::Value>(&v) {
+                        Ok(val) => {
+                            out.entry(bucket_id)
+                                .or_default()
+                                .insert(frag_key.to_string(), val);
+                        }
+                        Err(e) => {
+                            tracing::warn!(bucket = bucket_id, key = frag_key, error = %e, "skipping fragment with invalid JSON");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

@@ -89,38 +89,22 @@ async fn main() -> Result<()> {
     ));
     persistence.open_existing_room_dbs().ok();
 
-    // Populate in-memory rooms for any existing room DBs and load bucket flags.
+    // Register any existing room DBs as unloaded stubs in memory.
+    // Rooms must be explicitly loaded via the LoadRoom RPC before they can be used.
     let existing_rooms = persistence.list_room_ids();
     if !existing_rooms.is_empty() {
         for room_id in &existing_rooms {
-            let buckets = match persistence.room(*room_id) {
-                Some(rp) => rp.load_buckets().unwrap_or_default(),
-                None => std::collections::HashMap::new(),
-            };
-            let mut buckets_map = std::collections::HashMap::new();
-            let mut bucket_labels = std::collections::HashMap::new();
-            let mut bucket_flags = std::collections::HashMap::new();
-            for (id, rec) in buckets {
-                buckets_map.insert(id, std::collections::HashMap::new());
-                if let Some(lbl) = rec.label {
-                    bucket_labels.insert(id, lbl);
-                }
-                bucket_flags.insert(id, rec.flags);
-            }
-            let members = match persistence.room(*room_id) {
-                Some(rp) => rp.load_members().unwrap_or_default(),
-                None => std::collections::HashSet::new(),
-            };
             base_state.rooms.insert(
                 *room_id,
                 Arc::new(std::sync::RwLock::new(crate::state::RoomState {
-                    buckets: buckets_map,
+                    buckets: std::collections::HashMap::new(),
                     room_counter: 0,
                     tx_buffer: None,
                     io_locked: false,
-                    bucket_labels,
-                    bucket_flags,
-                    members,
+                    loaded: false,
+                    bucket_labels: std::collections::HashMap::new(),
+                    bucket_flags: std::collections::HashMap::new(),
+                    members: std::collections::HashSet::new(),
                 })),
             );
         }
@@ -130,6 +114,7 @@ async fn main() -> Result<()> {
                 base_state.next_room_id = max_id + 1;
             }
         }
+        info!(rooms = existing_rooms.len(), "registered existing rooms as unloaded stubs; use LoadRoom to activate");
     }
 
     let shared_state = Arc::new(RwLock::new(base_state));

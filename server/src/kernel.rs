@@ -168,31 +168,14 @@ impl SyncpondKernel {
             Commands::NewRoom(name) => {
                 let mut app = self.state.write().await;
                 let room_id = app.create_room();
-                // try to open per-room RocksDB for this new room (best-effort)
+                // open per-room RocksDB for this new room (best-effort)
                 if let Err(e) = self.persistence.open_room_db(room_id) {
                     error!(new_room = room_id, error = %e, "failed to open room rocksdb");
                 }
-                // attempt to load any existing bucket records from DB into the in-memory room state
-                if let Some(rp) = self.persistence.room(room_id) {
-                    if let Ok(buckets) = rp.load_buckets() {
-                        if let Some(room_arc) = app.rooms.get(&room_id) {
-                            if let Ok(mut room) = room_arc.write() {
-                                for (id, rec) in buckets.iter() {
-                                    room.bucket_flags.insert(*id, rec.flags);
-                                    if let Some(lbl) = &rec.label {
-                                        room.bucket_labels.insert(*id, lbl.clone());
-                                    }
-                                    room.buckets.entry(*id).or_insert_with(HashMap::new);
-                                }
-                            }
-                        }
-                    }
-                }
                 if !name.trim().is_empty() {
-                    // best-effort set label, ignore failures
                     let _ = app.set_room_label(room_id, name);
                 }
-                info!(new_room = room_id, "created new room");
+                info!(new_room = room_id, "created new room (loaded, empty)");
                 CommandResponse::NewRoomResponse(room_id)
             }
             Commands::CloseRoom(room_id) => {
@@ -214,8 +197,10 @@ impl SyncpondKernel {
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     let label_trimmed = label.trim().to_string();
                     if let Ok(mut room) = room_arc.write() {
+                        if !room.loaded {
+                            return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                        }
                         room.buckets.entry(bucket_id).or_insert_with(HashMap::new);
-                        // ensure bucket flags map has an entry for this bucket (default 0)
                         room.bucket_flags.entry(bucket_id).or_insert(0u32);
                         if !label_trimmed.is_empty() {
                             room.bucket_labels.insert(bucket_id, label_trimmed.clone());
@@ -240,8 +225,10 @@ impl SyncpondKernel {
                 let app = self.state.write().await;
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     if let Ok(mut room) = room_arc.write() {
+                        if !room.loaded {
+                            return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                        }
                         room.buckets.remove(&bucket_id);
-                        // remove any label and flags associated with this bucket
                         room.bucket_labels.remove(&bucket_id);
                         room.bucket_flags.remove(&bucket_id);
                     }
@@ -260,6 +247,9 @@ impl SyncpondKernel {
                 let app = self.state.write().await;
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     if let Ok(mut room) = room_arc.write() {
+                        if !room.loaded {
+                            return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                        }
                         if !member_trimmed.is_empty() {
                             room.members.insert(member_trimmed.clone());
                         }
@@ -278,6 +268,9 @@ impl SyncpondKernel {
                 let app = self.state.write().await;
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     if let Ok(mut room) = room_arc.write() {
+                        if !room.loaded {
+                            return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                        }
                         room.members.remove(&member_trimmed);
                     }
                     let _ = self.persistence.open_room_db(room_id);
@@ -290,6 +283,10 @@ impl SyncpondKernel {
                 CommandResponse::DeleteMemberResponse
             }
             Commands::WriteFragment(room_id, bucket_id, key, data) => {
+                // Reject writes to unloaded rooms.
+                if !self.state.read().await.is_room_loaded(room_id) {
+                    return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                }
                 // try to parse payload as JSON, fall back to string
                 let parsed: Value = match serde_json::from_slice(&data) {
                     Ok(v) => v,
@@ -358,7 +355,63 @@ impl SyncpondKernel {
                         Ok(vec) => CommandResponse::FragmentReadResponse(Some(vec)),
                         Err(_) => CommandResponse::FragmentReadResponse(None),
                     },
+                    Err(e) if e.to_string() == "room_not_loaded" => {
+                        CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()))
+                    }
                     Err(_) => CommandResponse::FragmentReadResponse(None),
+                }
+            }
+            Commands::LoadRoom(room_id) => {
+                // Ensure the room's RocksDB is open.
+                if let Err(e) = self.persistence.open_room_db(room_id) {
+                    error!(room = room_id, error = %e, "LoadRoom: failed to open room rocksdb");
+                    return CommandResponse::LoadRoomResponse(Err(format!("db_open_failed: {}", e)));
+                }
+
+                let (bucket_defs, members, fragments) = match self.persistence.room(room_id) {
+                    Some(rp) => {
+                        let buckets = rp.load_buckets().unwrap_or_default();
+                        let members = rp.load_members().unwrap_or_default();
+                        let fragments = match rp.load_all_fragments() {
+                            Ok(f) => f,
+                            Err(e) => {
+                                error!(room = room_id, error = %e, "LoadRoom: failed to load fragments");
+                                return CommandResponse::LoadRoomResponse(Err(format!("fragment_load_failed: {}", e)));
+                            }
+                        };
+                        let defs: Vec<(u64, Option<String>, u32)> = buckets
+                            .into_values()
+                            .map(|rec| (rec.id, rec.label, rec.flags))
+                            .collect();
+                        (defs, members, fragments)
+                    }
+                    None => (Vec::new(), std::collections::HashSet::new(), std::collections::HashMap::new()),
+                };
+
+                let app = self.state.read().await;
+                match app.load_room_data(room_id, &bucket_defs, members, fragments) {
+                    Ok(()) => {
+                        let bucket_count = bucket_defs.len();
+                        info!(room = room_id, buckets = bucket_count, "room loaded");
+                        CommandResponse::LoadRoomResponse(Ok(()))
+                    }
+                    Err(e) => {
+                        error!(room = room_id, error = %e, "LoadRoom: state load failed");
+                        CommandResponse::LoadRoomResponse(Err(e.to_string()))
+                    }
+                }
+            }
+            Commands::UnloadRoom(room_id) => {
+                let app = self.state.read().await;
+                match app.unload_room(room_id) {
+                    Ok(()) => {
+                        info!(room = room_id, "room unloaded");
+                        CommandResponse::UnloadRoomResponse(Ok(()))
+                    }
+                    Err(e) => {
+                        error!(room = room_id, error = %e, "UnloadRoom failed");
+                        CommandResponse::UnloadRoomResponse(Err(e.to_string()))
+                    }
                 }
             }
         }

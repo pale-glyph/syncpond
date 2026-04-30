@@ -24,6 +24,9 @@ pub enum Commands {
     WriteFragment(RoomId, BucketId, String, FragmentData),
     SetFragmentFlags(RoomId, FragmentId, FragmentFlags),
     ReadFragment(RoomId, BucketId, String),
+    // Load/unload room
+    LoadRoom(RoomId),
+    UnloadRoom(RoomId),
     /// Raw message forwarded from a websocket client tied to a room.
     WsMessage(RoomId, Value),
 }
@@ -45,6 +48,9 @@ pub enum CommandResponse {
     FragmentWriteResponse,
     SetFragmentFlagsResponse,
     FragmentReadResponse(Option<FragmentData>),
+    /// Room load/unload responses
+    LoadRoomResponse(Result<(), String>),
+    UnloadRoomResponse(Result<(), String>),
     /// Acknowledgement for a websocket-forwarded message.
     WsMessageAck,
 }
