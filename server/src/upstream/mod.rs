@@ -53,6 +53,7 @@ impl CommandServer {
     pub async fn new_bucket(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), String> {
         match self.kernel.handle_command(Commands::NewBucket(room_id, bucket_id, label)).await {
             CommandResponse::NewBucketResponse => Ok(()),
+            CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
             _ => Err("new_bucket_failed".to_string()),
         }
     }
@@ -60,6 +61,7 @@ impl CommandServer {
     pub async fn delete_bucket(&self, room_id: u64, bucket_id: u64) -> Result<(), String> {
         match self.kernel.handle_command(Commands::DeleteBucket(room_id, bucket_id)).await {
             CommandResponse::DeleteBucketResponse => Ok(()),
+            CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
             _ => Err("delete_bucket_failed".to_string()),
         }
     }
@@ -67,6 +69,7 @@ impl CommandServer {
     pub async fn new_member(&self, room_id: u64, member: String) -> Result<(), String> {
         match self.kernel.handle_command(Commands::NewMember(room_id, member)).await {
             CommandResponse::NewMemberResponse => Ok(()),
+            CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
             _ => Err("new_member_failed".to_string()),
         }
     }
@@ -74,6 +77,7 @@ impl CommandServer {
     pub async fn delete_member(&self, room_id: u64, member: String) -> Result<(), String> {
         match self.kernel.handle_command(Commands::DeleteMember(room_id, member)).await {
             CommandResponse::DeleteMemberResponse => Ok(()),
+            CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
             _ => Err("delete_member_failed".to_string()),
         }
     }
@@ -109,6 +113,41 @@ impl CommandServer {
         }
 
         Vec::new()
+    }
+
+    /// Read a fragment by key from a specific room/bucket. Returns the raw bytes of
+    /// the JSON-serialised value, or `None` if not found, or `Err` if the room is not loaded.
+    pub async fn read_fragment(&self, room_id: u64, bucket_id: u64, key: String) -> Result<Option<Vec<u8>>, String> {
+        match self.kernel.handle_command(Commands::ReadFragment(room_id, bucket_id, key)).await {
+            CommandResponse::FragmentReadResponse(data) => Ok(data),
+            CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
+            _ => Ok(None),
+        }
+    }
+
+    /// Write a fragment to a specific room/bucket and emit a downstream notification.
+    pub async fn write_fragment(&self, room_id: u64, bucket_id: u64, key: String, data: Vec<u8>) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::WriteFragment(room_id, bucket_id, key, data)).await {
+            CommandResponse::FragmentWriteResponse => Ok(()),
+            CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
+            _ => Err("write_fragment_failed".to_string()),
+        }
+    }
+
+    /// Load a room's full dataset from persistence into memory.
+    pub async fn load_room(&self, room_id: u64) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::LoadRoom(room_id)).await {
+            CommandResponse::LoadRoomResponse(result) => result,
+            _ => Err("load_room_failed".to_string()),
+        }
+    }
+
+    /// Evict a room's in-memory data.
+    pub async fn unload_room(&self, room_id: u64) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::UnloadRoom(room_id)).await {
+            CommandResponse::UnloadRoomResponse(result) => result,
+            _ => Err("unload_room_failed".to_string()),
+        }
     }
 
     // Room/bucket labels are set only at creation time; label get/set RPCs removed.

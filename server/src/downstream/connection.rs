@@ -119,6 +119,16 @@ pub async fn handle_ws_connection(
     allowed_buckets.insert(0);
     allowed_buckets.remove(&crate::state::SERVER_ONLY_BUCKET_ID);
 
+    let room_id = match claims.room_id {
+        Some(id) if id > 0 => id,
+        _ => {
+            warn!(%peer, reason = "invalid_jwt_missing_room_id", "ws auth failure");
+            let err = json!({"type":"auth_error","reason":"invalid_jwt_missing_room_id"});
+            ws_sender.send(Message::Text(err.to_string())).await.ok();
+            return Ok(());
+        }
+    };
+
     // No initial snapshot from SharedState here. Kernel will send updates.
     let bucket_count = 0usize;
     let room_counter = 0u64;
@@ -138,7 +148,7 @@ pub async fn handle_ws_connection(
     let conn_id = {
         let mut hub = ws_hub.lock().await;
         let conn_id = hub.allocate_connection_id();
-        match hub.add_client(conn_id, 0, allowed_buckets.clone(), tx.clone()) {
+        match hub.add_client(conn_id, room_id, allowed_buckets.clone(), tx.clone()) {
             Ok(()) => conn_id,
             Err(reason) => {
                 let err = json!({"type":"auth_error","reason":reason});

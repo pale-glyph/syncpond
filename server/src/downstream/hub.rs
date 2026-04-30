@@ -117,6 +117,11 @@ impl WsHub {
         Ok(())
     }
 
+    /// Return the room_id associated with a connection, if it exists.
+    pub fn get_client_room_id(&self, conn_id: u64) -> Option<u64> {
+        self.connections.get(&conn_id).map(|c| c.room_id)
+    }
+
     /// Remove a connection from the hub by its numeric connection id.
     pub fn remove_client(&mut self, conn_id: u64) {
         if let Some(client) = self.connections.remove(&conn_id) {

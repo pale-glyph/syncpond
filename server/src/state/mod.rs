@@ -1,5 +1,4 @@
-pub mod rooms;
-
+#![allow(dead_code)]
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 /// Bucket flag bits indicating metadata for a bucket.
@@ -19,22 +18,10 @@ pub type SharedState = Arc<RwLock<AppState>>;
 /// Reserved bucket id for server-only data within state module.
 pub const SERVER_ONLY_BUCKET_ID: u64 = u64::MAX;
 
-/// Event produced when a room's data changes that should be broadcast to WS clients.
-#[derive(Debug, Clone)]
-pub struct RoomUpdate {
-    pub room_id: u64,
-    pub container: String,
-    pub key: String,
-    pub value: Option<serde_json::Value>,
-    pub room_counter: u64,
-}
-
 #[derive(Debug)]
 pub struct FragmentEntry {
     pub value: Value,
     pub key_version: u64,
-    /// `true` once this fragment has been written to disk via SAVE.
-    pub persisted: bool,
 }
 
 #[derive(Debug)]
@@ -46,6 +33,9 @@ pub struct RoomState {
     /// Set to `true` while a SAVE or LOAD is in progress for this room.
     /// All other operations against the room will return `RoomIoBusy`.
     pub io_locked: bool,
+    /// Whether this room is currently loaded (data resident in memory).
+    /// Operations that read or write room data require `loaded == true`.
+    pub loaded: bool,
     /// Optional human-friendly labels for buckets in this room.
     /// Maps numeric bucket id -> label string.
     pub bucket_labels: HashMap<u64, String>,
@@ -113,6 +103,8 @@ pub enum StateError {
     LabelInvalid,
     /// A SAVE or LOAD operation is currently in progress for this room.
     RoomIoBusy,
+    /// The room exists but is not loaded into memory.
+    RoomNotLoaded,
 }
 
 impl std::fmt::Display for StateError {
@@ -136,6 +128,7 @@ impl std::fmt::Display for StateError {
             StateError::LabelInUse => write!(f, "label_in_use"),
             StateError::LabelInvalid => write!(f, "label_invalid"),
             StateError::RoomIoBusy => write!(f, "room_io_busy"),
+            StateError::RoomNotLoaded => write!(f, "room_not_loaded"),
         }
     }
 }
@@ -213,7 +206,7 @@ impl AppState {
         }
     }
 
-    /// Create and return a new room ID.
+    /// Create and return a new room ID. New rooms start as loaded (empty, immediately usable).
     pub fn create_room(&mut self) -> u64 {
         let room_id = self.next_room_id;
         self.next_room_id += 1;
@@ -224,12 +217,68 @@ impl AppState {
                 room_counter: 0,
                 tx_buffer: None,
                 io_locked: false,
+                loaded: true,
                 bucket_labels: HashMap::new(),
                 bucket_flags: HashMap::new(),
                 members: std::collections::HashSet::new(),
             })),
         );
         room_id
+    }
+
+    /// Return whether a room is currently loaded (data resident in memory).
+    pub fn is_room_loaded(&self, room_id: u64) -> bool {
+        if let Some(room_arc) = self.rooms.get(&room_id) {
+            if let Ok(room) = room_arc.read() {
+                return room.loaded;
+            }
+        }
+        false
+    }
+
+    /// Populate a room's in-memory state from persisted data and mark it as loaded.
+    /// `bucket_defs`: iterator of (bucket_id, label, flags).
+    /// `members`: full member set.
+    /// `fragments`: bucket_id → key → value map.
+    pub fn load_room_data(
+        &self,
+        room_id: u64,
+        bucket_defs: &[(u64, Option<String>, u32)],
+        members: std::collections::HashSet<String>,
+        fragments: HashMap<u64, HashMap<String, Value>>,
+    ) -> Result<(), StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        room.buckets.clear();
+        room.bucket_labels.clear();
+        room.bucket_flags.clear();
+        for (id, label, flags) in bucket_defs {
+            room.bucket_flags.insert(*id, *flags);
+            if let Some(lbl) = label {
+                room.bucket_labels.insert(*id, lbl.clone());
+            }
+            let frag_map = fragments.get(id).cloned().unwrap_or_default();
+            let entry_map: HashMap<String, FragmentEntry> = frag_map
+                .into_iter()
+                .map(|(key, val)| (key, FragmentEntry { value: val, key_version: 0 }))
+                .collect();
+            room.buckets.insert(*id, entry_map);
+        }
+        room.members = members;
+        room.loaded = true;
+        Ok(())
+    }
+
+    /// Evict a room's in-memory data and mark it as unloaded.
+    pub fn unload_room(&self, room_id: u64) -> Result<(), StateError> {
+        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
+        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
+        room.loaded = false;
+        room.buckets.clear();
+        room.bucket_labels.clear();
+        room.bucket_flags.clear();
+        room.members.clear();
+        Ok(())
     }
 
     /// Delete a room by ID.
@@ -326,6 +375,9 @@ impl AppState {
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
         }
+        if !room.loaded {
+            return Err(StateError::RoomNotLoaded);
+        }
 
         room.members.insert(member_trimmed.to_string());
         Ok(())
@@ -337,6 +389,9 @@ impl AppState {
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
+        }
+        if !room.loaded {
+            return Err(StateError::RoomNotLoaded);
         }
 
         if !room.members.remove(member) {
@@ -351,6 +406,9 @@ impl AppState {
         let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
+        }
+        if !room.loaded {
+            return Err(StateError::RoomNotLoaded);
         }
 
         let mut members: Vec<String> = room.members.iter().cloned().collect();
@@ -380,6 +438,9 @@ impl AppState {
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
         }
+        if !room.loaded {
+            return Err(StateError::RoomNotLoaded);
+        }
 
         if let Some(buffer) = room.tx_buffer.as_mut() {
             buffer.push(RoomCommand::Set {
@@ -398,7 +459,6 @@ impl AppState {
             FragmentEntry {
                 value,
                 key_version,
-                persisted: false,
             },
         );
 
@@ -416,6 +476,9 @@ impl AppState {
         let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
+        }
+        if !room.loaded {
+            return Err(StateError::RoomNotLoaded);
         }
 
         if let Some(buffer) = room.tx_buffer.as_mut() {
@@ -435,7 +498,6 @@ impl AppState {
             FragmentEntry {
                 value: Value::Null,
                 key_version,
-                persisted: false,
             },
         );
         Ok(())
@@ -453,6 +515,9 @@ impl AppState {
         if room.io_locked {
             return Err(StateError::RoomIoBusy);
         }
+        if !room.loaded {
+            return Err(StateError::RoomNotLoaded);
+        }
         let bucket_map = room
             .buckets
             .get(&bucket_id)
@@ -464,50 +529,6 @@ impl AppState {
         }
 
         Ok((fragment.value.clone(), fragment.key_version))
-    }
-
-    /// Get whether a fragment has been persisted to disk via SAVE.
-    pub fn get_fragment_persisted(
-        &self,
-        room_id: u64,
-        bucket_id: u64,
-        key: &str,
-    ) -> Result<bool, StateError> {
-        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
-        let room = room_arc.read().map_err(|_| StateError::RoomNotFound)?;
-        if room.io_locked {
-            return Err(StateError::RoomIoBusy);
-        }
-        let bucket_map = room
-            .buckets
-            .get(&bucket_id)
-            .ok_or(StateError::BucketNotFound)?;
-        let fragment = bucket_map.get(key).ok_or(StateError::FragmentNotFound)?;
-        Ok(fragment.persisted)
-    }
-
-    /// Set or unset the persisted flag for a fragment. Returns error if room/container/key missing.
-    pub fn set_fragment_persisted(
-        &self,
-        room_id: u64,
-        bucket_id: u64,
-        key: String,
-        persisted: bool,
-    ) -> Result<(), StateError> {
-        let room_arc = self.rooms.get(&room_id).ok_or(StateError::RoomNotFound)?;
-        let mut room = room_arc.write().map_err(|_| StateError::RoomNotFound)?;
-        if room.io_locked {
-            return Err(StateError::RoomIoBusy);
-        }
-        let bucket_map = room
-            .buckets
-            .get_mut(&bucket_id)
-            .ok_or(StateError::BucketNotFound)?;
-        let entry = bucket_map
-            .get_mut(&key)
-            .ok_or(StateError::FragmentNotFound)?;
-        entry.persisted = persisted;
-        Ok(())
     }
 
     /// Get the room version counter for the specified room.
@@ -728,6 +749,7 @@ impl AppState {
         #[derive(Debug, Serialize, Deserialize)]
         struct JwtClaims {
             sub: String,
+            room_id: u64,
             buckets: Vec<u64>,
             exp: usize,
             iss: Option<String>,
@@ -736,6 +758,7 @@ impl AppState {
 
         let claims = JwtClaims {
             sub: sub_trimmed.to_string(),
+            room_id,
             buckets: bucket_set.into_iter().collect(),
             exp: exp as usize,
             iss: self.jwt_issuer.clone(),
@@ -788,7 +811,6 @@ impl AppState {
                         FragmentEntry {
                             value,
                             key_version,
-                            persisted: false,
                         },
                     );
                 }
@@ -803,7 +825,6 @@ impl AppState {
                         FragmentEntry {
                             value: Value::Null,
                             key_version,
-                            persisted: false,
                         },
                     );
                 }

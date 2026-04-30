@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
+    pub room_id: Option<u64>,
     pub buckets: Option<Vec<u64>>,
     pub exp: usize,
 }

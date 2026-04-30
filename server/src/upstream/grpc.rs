@@ -9,6 +9,17 @@ pub mod proto {
 }
 
 use proto::command_service_server::{CommandService, CommandServiceServer};
+
+/// Map a kernel error string to the appropriate gRPC `Status`.
+/// `room_not_loaded` → `failed_precondition`; `room_not_found` → `not_found`; others → `internal`.
+fn map_room_error(e: &str) -> Status {
+    match e {
+        "room_not_loaded" => Status::failed_precondition(e),
+        "room_not_found" => Status::not_found(e),
+        _ => Status::internal(e),
+    }
+}
+
 #[derive(Clone)]
 struct CommandServiceImpl {
     inner: Arc<super::CommandServer>,
@@ -85,7 +96,7 @@ impl CommandService for CommandServiceImpl {
 
         match self.inner.new_bucket(room_id, bucket_id, label).await {
             Ok(()) => Ok(Response::new(proto::NewBucketResponse {})),
-            Err(e) => Err(Status::internal(e)),
+            Err(e) => Err(map_room_error(&e)),
         }
     }
 
@@ -99,7 +110,7 @@ impl CommandService for CommandServiceImpl {
 
         match self.inner.delete_bucket(room_id, bucket_id).await {
             Ok(()) => Ok(Response::new(proto::DeleteBucketResponse {})),
-            Err(e) => Err(Status::not_found(e)),
+            Err(e) => Err(map_room_error(&e)),
         }
     }
 
@@ -113,7 +124,7 @@ impl CommandService for CommandServiceImpl {
 
         match self.inner.new_member(room_id, member).await {
             Ok(()) => Ok(Response::new(proto::NewMemberResponse {})),
-            Err(e) => Err(Status::not_found(e)),
+            Err(e) => Err(map_room_error(&e)),
         }
     }
 
@@ -127,7 +138,7 @@ impl CommandService for CommandServiceImpl {
 
         match self.inner.delete_member(room_id, member).await {
             Ok(()) => Ok(Response::new(proto::DeleteMemberResponse {})),
-            Err(e) => Err(Status::not_found(e)),
+            Err(e) => Err(map_room_error(&e)),
         }
     }
 
@@ -151,6 +162,51 @@ impl CommandService for CommandServiceImpl {
 
         let entries = self.inner.list_buckets(room_id).await;
         Ok(Response::new(proto::ListBucketsResponse { buckets: entries }))
+    }
+
+    async fn read_fragment(
+        &self,
+        request: Request<proto::ReadFragmentRequest>,
+    ) -> Result<Response<proto::ReadFragmentResponse>, Status> {
+        let req = request.into_inner();
+        match self.inner.read_fragment(req.room_id, req.bucket_id, req.key).await {
+            Ok(Some(data)) => Ok(Response::new(proto::ReadFragmentResponse { data, found: true })),
+            Ok(None) => Ok(Response::new(proto::ReadFragmentResponse { data: vec![], found: false })),
+            Err(e) => Err(map_room_error(&e)),
+        }
+    }
+
+    async fn write_fragment(
+        &self,
+        request: Request<proto::WriteFragmentRequest>,
+    ) -> Result<Response<proto::WriteFragmentResponse>, Status> {
+        let req = request.into_inner();
+        match self.inner.write_fragment(req.room_id, req.bucket_id, req.key, req.data).await {
+            Ok(()) => Ok(Response::new(proto::WriteFragmentResponse {})),
+            Err(e) => Err(map_room_error(&e)),
+        }
+    }
+
+    async fn load_room(
+        &self,
+        request: Request<proto::LoadRoomRequest>,
+    ) -> Result<Response<proto::LoadRoomResponse>, Status> {
+        let req = request.into_inner();
+        match self.inner.load_room(req.room_id).await {
+            Ok(()) => Ok(Response::new(proto::LoadRoomResponse {})),
+            Err(e) => Err(Status::failed_precondition(e)),
+        }
+    }
+
+    async fn unload_room(
+        &self,
+        request: Request<proto::UnloadRoomRequest>,
+    ) -> Result<Response<proto::UnloadRoomResponse>, Status> {
+        let req = request.into_inner();
+        match self.inner.unload_room(req.room_id).await {
+            Ok(()) => Ok(Response::new(proto::UnloadRoomResponse {})),
+            Err(e) => Err(Status::not_found(e)),
+        }
     }
 }
 
