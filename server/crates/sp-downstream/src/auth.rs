@@ -10,48 +10,66 @@ pub struct Claims {
     pub exp: usize,
 }
 
-pub fn validate_jwt_claims(
-    jwt_key: Option<&str>,
-    jwt_issuer: Option<&str>,
-    jwt_audience: Option<&str>,
-    token: &str,
-    reserved_bucket_id: u64,
-) -> Result<Claims, String> {
-    let jwt_key = jwt_key.ok_or_else(|| "no_jwt_key".to_string())?;
+#[derive(Debug)]
+pub struct AuthConfig {
+    pub jwt_key: String,
+    pub jwt_issuer: String,
+    pub jwt_audience: String,
+}
 
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.algorithms = vec![Algorithm::HS256];
-    validation.set_required_spec_claims(&["exp"]);
-    validation.validate_exp = true;
+impl AuthConfig {
+    pub fn from_env() -> Result<Self, anyhow::Error> {
+        let jwt_key: String = std::env::var("JWT_KEY").unwrap_or_default();
+        let jwt_issuer: String = std::env::var("JWT_ISSUER").unwrap_or_default();
+        let jwt_audience = std::env::var("JWT_AUDIENCE").unwrap_or_default();
 
-    if let Some(issuer) = jwt_issuer {
-        validation.set_issuer(&[issuer]);
-    }
-    if let Some(audience) = jwt_audience {
-        validation.set_audience(&[audience]);
-    }
-
-    let token_data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(jwt_key.as_ref()),
-        &validation,
-    )
-    .map_err(|e| format!("invalid_jwt:{}", e))?;
-
-    let claims = token_data.claims;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as usize;
-    if claims.exp <= now {
-        return Err("expired_jwt".to_string());
-    }
-
-    if let Some(buckets) = &claims.buckets {
-        if buckets.iter().any(|id| *id == reserved_bucket_id) {
-            return Err("invalid_jwt_reserved_bucket".to_string());
+        if jwt_key.is_empty() {
+            return Err(anyhow::anyhow!(
+                "JWT_KEY environment variable is required for authentication"
+            ));
         }
+
+        if jwt_issuer.is_empty() {
+            return Err(anyhow::anyhow!(
+                "JWT_ISSUER environment variable is required for authentication"
+            ));
+        }
+
+        if jwt_audience.is_empty() {
+            return Err(anyhow::anyhow!(
+                "JWT_AUDIENCE environment variable is required for authentication"
+            ));
+        }
+
+        Ok(Self {
+            jwt_key,
+            jwt_issuer,
+            jwt_audience,
+        })
     }
 
-    Ok(claims)
+    pub fn validate_jwt(&self, token: &str) -> Result<Claims, String> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.algorithms = vec![Algorithm::HS256];
+        validation.set_required_spec_claims(&["exp"]);
+        validation.validate_exp = true;
+
+        let token_data = decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(self.jwt_key.as_ref()),
+            &validation,
+        )
+        .map_err(|e| format!("invalid_jwt:{}", e))?;
+
+        let claims = token_data.claims;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as usize;
+        if claims.exp <= now {
+            return Err("expired_jwt".to_string());
+        }
+
+        Ok(claims)
+    }
 }

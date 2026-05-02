@@ -1,7 +1,7 @@
 use crate::proto::{DataUpdate as ProtoDataUpdate, WsEnvelope};
 use prost::Message;
 use serde_json;
-use sp_protocol::{DataUpdate, UpdateChannelMessage};
+use sp_protocol::{DataUpdate, DownstreamMessage, UpdateChannelMessage};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -18,31 +18,25 @@ pub struct ClientInfo {
     pub sender: mpsc::Sender<Vec<u8>>,
 }
 
-pub struct WsHub<C> {
+pub struct WsHub {
     next_conn_id: u64,
     connections: HashMap<u64, ClientInfo>,
     buckets: HashMap<u64, HashSet<u64>>,
     notification_receiver: Option<mpsc::Receiver<UpdateChannelMessage>>,
-    command_sender: mpsc::Sender<C>,
-    command_factory: Arc<dyn Fn(u64, Vec<u8>) -> C + Send + Sync>,
+    downstream_sender: mpsc::Sender<DownstreamMessage>,
 }
 
-impl<C> WsHub<C>
-where
-    C: Send + 'static,
-{
+impl WsHub {
     pub fn new(
         notification_receiver: mpsc::Receiver<UpdateChannelMessage>,
-        command_sender: mpsc::Sender<C>,
-        command_factory: Arc<dyn Fn(u64, Vec<u8>) -> C + Send + Sync>,
+        downstream_sender: mpsc::Sender<DownstreamMessage>,
     ) -> Self {
         Self {
             next_conn_id: 1,
             connections: HashMap::new(),
             buckets: HashMap::new(),
             notification_receiver: Some(notification_receiver),
-            command_sender,
-            command_factory,
+            downstream_sender,
         }
     }
 
@@ -107,8 +101,8 @@ where
 
     pub async fn process_client_message(&self, conn_id: u64, msg: Vec<u8>) {
         if let Some(client) = self.connections.get(&conn_id) {
-            let cmd = (self.command_factory)(client.room_id, msg);
-            if let Err(err) = self.command_sender.send(cmd).await {
+            let event = DownstreamMessage::WsMessage(client.room_id, msg);
+            if let Err(err) = self.downstream_sender.send(event).await {
                 warn!(client = conn_id, %err, "ws client command channel closed");
             }
         } else {
@@ -172,7 +166,7 @@ where
     }
 
     pub async fn run_forwarder(
-        ws_hub: Arc<Mutex<WsHub<C>>>,
+        ws_hub: Arc<Mutex<WsHub>>,
         mut rx: mpsc::Receiver<UpdateChannelMessage>,
     ) {
         while let Some(msg) = rx.recv().await {

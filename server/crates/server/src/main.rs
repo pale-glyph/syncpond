@@ -12,10 +12,8 @@ use crate::command::Commands;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
-use sp_downstream::{ConnectionEvent, Downstream};
-use sp_kernel::{
-    AppState, KernelSignal, PersistenceManager, RoomState, SyncpondKernel, SERVER_ONLY_BUCKET_ID,
-};
+use sp_downstream::{Downstream, DownstreamMessage};
+use sp_kernel::{AppState, PersistenceManager, RoomState, SyncpondKernel, SERVER_ONLY_BUCKET_ID};
 use sp_upstream::{CommandHandler, CommandServer, GrpcServer};
 use std::{fs, net::SocketAddr, sync::Arc};
 
@@ -290,14 +288,11 @@ async fn main() -> Result<()> {
 
     let shared_state = Arc::new(RwLock::new(base_state));
 
-    // Channels for commands (from WS clients -> kernel) and signals (to kernel).
-    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<Commands>(1024);
-    let (signal_tx, signal_rx) = tokio::sync::mpsc::channel::<KernelSignal>(1024);
+    // Channels for upstream commands and downstream websocket messages.
+    let (_command_tx, command_rx) = tokio::sync::mpsc::channel::<Commands>(1024);
+    let (downstream_tx, downstream_rx) = tokio::sync::mpsc::channel::<DownstreamMessage>(1024);
 
-    let downstream = Downstream::new(
-        command_tx.clone(),
-        Arc::new(move |room_id, msg| Commands::WsMessage(room_id, msg)),
-    );
+    let downstream = Downstream::new(downstream_tx.clone());
 
     let ws_allowed_origins = config.ws_allowed_origins.clone().unwrap_or_else(|| {
         DEFAULT_WS_ALLOWED_ORIGINS
@@ -338,24 +333,9 @@ async fn main() -> Result<()> {
     let ws_server = downstream
         .spawn_ws_server(
             ws_addr,
-            signal_tx.clone(),
-            Arc::new(|event| match event {
-                ConnectionEvent::ClientConnected {
-                    conn_id,
-                    requested_buckets,
-                } => KernelSignal::ClientConnected {
-                    conn_id,
-                    requested_buckets,
-                },
-                ConnectionEvent::ClientDisconnected { conn_id } => {
-                    KernelSignal::ClientDisconnected { conn_id }
-                }
-            }),
+            downstream_tx.clone(),
             ws_allowed_origins.clone(),
             SERVER_ONLY_BUCKET_ID,
-            config.jwt_key.clone(),
-            config.jwt_issuer.clone(),
-            config.jwt_audience.clone(),
         )
         .await;
 
@@ -373,8 +353,8 @@ async fn main() -> Result<()> {
     let kernel_for_commands = kernel.clone();
     kernel_for_commands.start_command_processor(command_rx);
 
-    let kernel_for_signals = kernel.clone();
-    kernel_for_signals.start_signal_processor(signal_rx);
+    let kernel_for_downstream = kernel.clone();
+    kernel_for_downstream.start_downstream_message_processor(downstream_rx);
 
     // start upstream gRPC server for trusted application servers
     let grpc_addr_for_task = grpc_addr.clone();

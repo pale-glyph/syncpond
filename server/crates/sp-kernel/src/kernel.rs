@@ -2,37 +2,25 @@ use crate::persistance::PersistenceManager;
 use crate::state::SharedState;
 use serde_json::Value;
 use sp_downstream::{DataUpdate, Downstream};
-use sp_protocol::{CommandResponse, Commands};
+use sp_protocol::{CommandResponse, Commands, DownstreamMessage};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 // connection ids are numeric u64 allocated by WsHub
 use tracing::{debug, error, info};
-
-/// Signals that can be sent to the kernel from other components.
-#[derive(Debug)]
-pub enum KernelSignal {
-    ClientConnected {
-        conn_id: u64,
-        requested_buckets: Vec<u64>,
-    },
-    ClientDisconnected {
-        conn_id: u64,
-    },
-}
 
 /// The SyncpondKernel coordinates persistence (`state`) and downstream
 /// components (websockets). It exposes a command handler that the upstream
 /// gRPC server can call into.
 pub struct SyncpondKernel {
     pub state: SharedState,
-    pub downstream: Downstream<Commands>,
+    pub downstream: Downstream,
     pub persistence: Arc<PersistenceManager>,
 }
 
 impl SyncpondKernel {
     pub fn new(
         state: SharedState,
-        downstream: Downstream<Commands>,
+        downstream: Downstream,
         persistence: Arc<PersistenceManager>,
     ) -> Self {
         Self {
@@ -54,14 +42,14 @@ impl SyncpondKernel {
         });
     }
 
-    /// Start a background task that consumes `KernelSignal` values sent from
-    /// other components and logs/handles them. This is intentionally simple
-    /// for now; semantics can be extended later.
-    pub fn start_signal_processor(self: Arc<Self>, mut rx: mpsc::Receiver<KernelSignal>) {
+    /// Start a background task that consumes downstream websocket messages from
+    /// the downstream subsystem and handles them separately from upstream
+    /// commands.
+    pub fn start_downstream_message_processor(self: Arc<Self>, mut rx: mpsc::Receiver<DownstreamMessage>) {
         tokio::spawn(async move {
-            while let Some(sig) = rx.recv().await {
-                match sig {
-                    KernelSignal::ClientConnected {
+            while let Some(message) = rx.recv().await {
+                match message {
+                    DownstreamMessage::ClientConnected {
                         conn_id,
                         requested_buckets,
                     } => {
@@ -74,12 +62,21 @@ impl SyncpondKernel {
                         self.handle_client_connected(conn_id, requested_buckets)
                             .await;
                     }
-                    KernelSignal::ClientDisconnected { conn_id } => {
+                    DownstreamMessage::ClientDisconnected { conn_id } => {
                         info!(conn = conn_id, "client disconnected");
+                    }
+                    DownstreamMessage::WsMessage(room_id, msg) => {
+                        debug!(room = room_id, message = ?msg, "kernel received WS message from downstream");
+                        let _ = self.handle_ws_message(room_id, msg).await;
                     }
                 }
             }
         });
+    }
+
+    async fn handle_ws_message(&self, room_id: u64, msg: Vec<u8>) -> CommandResponse {
+        debug!(room = room_id, message = ?msg, "kernel received WS message forwarded as downstream message");
+        CommandResponse::WsMessageAck
     }
 
     async fn handle_client_connected(&self, conn_id: u64, requested_buckets: Vec<u64>) {
@@ -323,10 +320,6 @@ impl SyncpondKernel {
                 }
 
                 CommandResponse::FragmentWriteResponse
-            }
-            Commands::WsMessage(room_id, msg) => {
-                debug!(room = room_id, message = ?msg, "kernel received WS message forwarded as command");
-                CommandResponse::WsMessageAck
             }
             Commands::ReadFragment(room_id, bucket_id, key) => {
                 let app = self.state.read().await;

@@ -20,9 +20,9 @@ pub enum UpdateChannelMessage {
     Targeted { conn_id: u64, msg: DataUpdate },
 }
 
-/// Internal event emitted by the downstream websocket server back to the kernel.
+/// Messages emitted by the downstream websocket server back to the kernel.
 #[derive(Debug, Clone)]
-pub enum ConnectionEvent {
+pub enum DownstreamMessage {
     ClientConnected {
         conn_id: u64,
         requested_buckets: Vec<u64>,
@@ -30,9 +30,10 @@ pub enum ConnectionEvent {
     ClientDisconnected {
         conn_id: u64,
     },
+    WsMessage(RoomId, Vec<u8>),
 }
 
-/// Kernel commands for modifying state or reading fragments.
+/// Upstream commands for modifying state or reading fragments.
 #[derive(Debug)]
 pub enum Commands {
     NewRoom(RoomName),
@@ -44,7 +45,6 @@ pub enum Commands {
     ReadFragment(RoomId, BucketId, String),
     LoadRoom(RoomId),
     UnloadRoom(RoomId),
-    WsMessage(RoomId, Vec<u8>),
 }
 
 /// Responses returned from command execution.

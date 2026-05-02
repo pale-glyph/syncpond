@@ -1,10 +1,10 @@
-use crate::auth::validate_jwt_claims;
+use crate::auth::AuthConfig;
 use crate::hub::{WsHub, MAX_WS_PENDING_MESSAGES};
 use crate::proto::{AuthError, AuthOk, WsEnvelope};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use sp_protocol::ConnectionEvent;
+use sp_protocol::DownstreamMessage;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{
     net::TcpStream,
@@ -14,22 +14,14 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
-pub async fn handle_ws_connection<C, S>(
+pub async fn handle_ws_connection(
     stream: TcpStream,
     peer: SocketAddr,
-    ws_hub: Arc<Mutex<WsHub<C>>>,
-    signal_sender: mpsc::Sender<S>,
-    signal_mapper: Arc<dyn Fn(ConnectionEvent) -> S + Send + Sync>,
+    ws_hub: Arc<Mutex<WsHub>>,
+    downstream_sender: mpsc::Sender<DownstreamMessage>,
     reserved_bucket_id: u64,
     ws_allowed_origins: Vec<String>,
-    jwt_key: Option<String>,
-    jwt_issuer: Option<String>,
-    jwt_audience: Option<String>,
-) -> Result<()>
-where
-    C: Send + 'static,
-    S: Send + 'static,
-{
+) -> Result<()> {
     let _connection_start = Instant::now();
     let ws_stream = if !ws_allowed_origins.is_empty() {
         let origins = ws_allowed_origins.clone();
@@ -123,13 +115,8 @@ where
     };
 
     debug!(%peer, "validating jwt claims");
-    let claims = match validate_jwt_claims(
-        jwt_key.as_deref(),
-        jwt_issuer.as_deref(),
-        jwt_audience.as_deref(),
-        &auth_msg.jwt,
-        reserved_bucket_id,
-    ) {
+    let auth_config = AuthConfig::from_env()?;
+    let claims = match auth_config.validate_jwt(&auth_msg.jwt) {
         Ok(claims) => {
             info!(%peer, sub = %claims.sub, "ws auth success");
             claims
@@ -209,11 +196,11 @@ where
         }
     };
 
-    signal_sender
-        .try_send((signal_mapper)(ConnectionEvent::ClientConnected {
+    downstream_sender
+        .try_send(DownstreamMessage::ClientConnected {
             conn_id,
             requested_buckets: allowed_buckets.iter().cloned().collect(),
-        }))
+        })
         .ok();
 
     info!(%peer, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client added");
@@ -299,10 +286,8 @@ where
         hub.remove_client(conn_id);
     }
 
-    signal_sender
-        .try_send((signal_mapper)(ConnectionEvent::ClientDisconnected {
-            conn_id,
-        }))
+    downstream_sender
+        .try_send(DownstreamMessage::ClientDisconnected { conn_id })
         .ok();
 
     info!(%peer, "ws client disconnected");
