@@ -1,6 +1,5 @@
-use crate::command::{CommandResponse, Commands};
-use crate::downstream::hub::WsHub;
-use crate::downstream::hub::{DataUpdate, UpdateChannelMessage};
+use sp_protocol::{CommandResponse, Commands};
+use sp_downstream::{DataUpdate, UpdateChannelMessage, WsHub};
 use crate::persistance::PersistenceManager;
 use crate::state::SharedState;
 use serde_json::Value;
@@ -29,7 +28,7 @@ pub enum KernelSignal {
 /// gRPC server can call into.
 pub struct SyncpondKernel {
     pub state: SharedState,
-    pub _ws_hub: Arc<Mutex<WsHub>>,
+    pub _ws_hub: Arc<Mutex<WsHub<Commands>>>,
     pub persistence: Arc<PersistenceManager>,
     pub notification_sender: mpsc::Sender<UpdateChannelMessage>,
 }
@@ -37,7 +36,7 @@ pub struct SyncpondKernel {
 impl SyncpondKernel {
     pub fn new(
         state: SharedState,
-        ws_hub: Arc<Mutex<WsHub>>,
+        ws_hub: Arc<Mutex<WsHub<Commands>>>,
         persistence: Arc<PersistenceManager>,
         notification_sender: mpsc::Sender<UpdateChannelMessage>,
     ) -> Self {

@@ -1550,6 +1550,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "sp-downstream"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "jsonwebtoken",
+ "serde",
+ "serde_json",
+ "sp-protocol",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "sp-kernel"
+version = "0.1.0"
+dependencies = [
+ "jsonwebtoken",
+ "lru",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "sp-downstream",
+ "sp-protocol",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sp-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "sp-upstream"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "subtle",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tonic-reflection",
+]
+
+[[package]]
 name = "spin"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1594,23 +1646,25 @@ name = "syncpond-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures-util",
  "include_dir",
  "jsonwebtoken",
  "lru",
  "prost",
- "prost-build",
  "prost-types",
- "protoc-bin-vendored",
  "rocksdb",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sp-downstream",
+ "sp-kernel",
+ "sp-protocol",
+ "sp-upstream",
  "subtle",
  "tokio",
  "tokio-tungstenite",
  "tonic",
- "tonic-build",
  "tonic-reflection",
  "tracing",
  "tracing-subscriber",

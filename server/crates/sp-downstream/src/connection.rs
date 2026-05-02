@@ -1,30 +1,31 @@
-use crate::downstream::auth::{validate_jwt_claims, AuthMessage};
-use crate::downstream::hub::{WsHub, MAX_WS_PENDING_MESSAGES};
-use crate::kernel::KernelSignal;
+use crate::auth::{validate_jwt_claims, AuthMessage};
+use crate::hub::{WsHub, MAX_WS_PENDING_MESSAGES};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use sp_protocol::ConnectionEvent;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
-use tokio::{
-    net::TcpStream,
-    sync::{mpsc, Mutex},
-};
+use tokio::{net::TcpStream, sync::{mpsc, Mutex}};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
-// connection ids are numeric (allocated by WsHub)
 
-/// Handle an incoming websocket client connection, auth, and event routing.
-pub async fn handle_ws_connection(
+pub async fn handle_ws_connection<C, S>(
     stream: TcpStream,
     peer: SocketAddr,
-    ws_hub: Arc<Mutex<WsHub>>,
-    signal_sender: mpsc::Sender<KernelSignal>,
+    ws_hub: Arc<Mutex<WsHub<C>>>,
+    signal_sender: mpsc::Sender<S>,
+    signal_mapper: Arc<dyn Fn(ConnectionEvent) -> S + Send + Sync>,
+    reserved_bucket_id: u64,
     ws_allowed_origins: Vec<String>,
     jwt_key: Option<String>,
     jwt_issuer: Option<String>,
     jwt_audience: Option<String>,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: Send + 'static,
+    S: Send + 'static,
+{
     let _connection_start = Instant::now();
     let ws_stream = if !ws_allowed_origins.is_empty() {
         let origins = ws_allowed_origins.clone();
@@ -101,6 +102,7 @@ pub async fn handle_ws_connection(
         jwt_issuer.as_deref(),
         jwt_audience.as_deref(),
         &auth_msg.jwt,
+        reserved_bucket_id,
     ) {
         Ok(claims) => {
             info!(%peer, sub = %claims.sub, "ws auth success");
@@ -117,7 +119,7 @@ pub async fn handle_ws_connection(
 
     let mut allowed_buckets: HashSet<u64> = claims.buckets.unwrap_or_default().into_iter().collect();
     allowed_buckets.insert(0);
-    allowed_buckets.remove(&crate::state::SERVER_ONLY_BUCKET_ID);
+    allowed_buckets.remove(&reserved_bucket_id);
 
     let room_id = match claims.room_id {
         Some(id) if id > 0 => id,
@@ -129,11 +131,7 @@ pub async fn handle_ws_connection(
         }
     };
 
-    // No initial snapshot from SharedState here. Kernel will send updates.
-    let bucket_count = 0usize;
     let room_counter = 0u64;
-    debug!(%peer, bucket_count, "prepared empty room snapshot");
-
     let auth_ok = json!({
         "type": "auth_ok",
         "room_counter": room_counter,
@@ -159,10 +157,10 @@ pub async fn handle_ws_connection(
     };
 
     signal_sender
-        .try_send(KernelSignal::ClientConnected {
+        .try_send((signal_mapper)(ConnectionEvent::ClientConnected {
             conn_id,
             requested_buckets: allowed_buckets.iter().cloned().collect(),
-        })
+        }))
         .ok();
 
     info!(%peer, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client added");
@@ -186,7 +184,6 @@ pub async fn handle_ws_connection(
                     }
                     Some(Ok(Message::Text(txt))) => {
                         debug!(%peer, msg_len = txt.len(), "ws text message received");
-                        // Try to parse as JSON, otherwise forward as string value.
                         let v: Value = match serde_json::from_str(&txt) {
                             Ok(j) => j,
                             Err(_) => Value::String(txt.clone()),
@@ -230,7 +227,7 @@ pub async fn handle_ws_connection(
     }
 
     signal_sender
-        .try_send(KernelSignal::ClientDisconnected { conn_id })
+        .try_send((signal_mapper)(ConnectionEvent::ClientDisconnected { conn_id }))
         .ok();
 
     info!(%peer, "ws client disconnected");

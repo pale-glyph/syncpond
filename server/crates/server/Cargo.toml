@@ -6,9 +6,14 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
 tokio-tungstenite = "0.22"
+sp-downstream = { path = "../sp-downstream" }
+sp-upstream = { path = "../sp-upstream" }
+sp-kernel = { path = "../sp-kernel" }
+sp-protocol = { path = "../sp-protocol" }
 futures-util = "0.3"
 anyhow = "1.0"
 jsonwebtoken = "8"
+async-trait = "0.1"
 uuid = { version = "1.4", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -25,9 +30,4 @@ tonic = { version = "0.6", features = ["transport"] }
 prost = "0.9"
 prost-types = "0.9"
 tonic-reflection = "0.3"
-
-[build-dependencies]
-tonic-build = "0.6"
-prost-build = "0.9"
-protoc-bin-vendored = "3.2.0"
 

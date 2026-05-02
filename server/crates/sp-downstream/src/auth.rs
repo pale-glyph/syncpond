@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Claims {
     pub sub: String,
     pub room_id: Option<u64>,
-    pub buckets: Option<Vec<u64>>,
+    pub buckets: Option<Vec<u64>>, 
     pub exp: usize,
 }
 
@@ -23,13 +23,12 @@ pub fn validate_jwt_claims(
     jwt_issuer: Option<&str>,
     jwt_audience: Option<&str>,
     token: &str,
+    reserved_bucket_id: u64,
 ) -> Result<Claims, String> {
     let jwt_key = jwt_key.ok_or_else(|| "no_jwt_key".to_string())?;
 
     let mut validation = Validation::new(Algorithm::HS256);
-    // Explicitly lock algorithms to prevent algorithm confusion attacks.
     validation.algorithms = vec![Algorithm::HS256];
-    // Explicitly require `exp` and enforce expiration.
     validation.set_required_spec_claims(&["exp"]);
     validation.validate_exp = true;
 
@@ -53,7 +52,7 @@ pub fn validate_jwt_claims(
     }
 
     if let Some(buckets) = &claims.buckets {
-        if buckets.iter().any(|id| *id == crate::state::SERVER_ONLY_BUCKET_ID) {
+        if buckets.iter().any(|id| *id == reserved_bucket_id) {
             return Err("invalid_jwt_reserved_bucket".to_string());
         }
     }

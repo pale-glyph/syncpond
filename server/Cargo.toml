@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/server"]
+members = ["crates/server", "crates/sp-downstream", "crates/sp-upstream", "crates/sp-protocol", "crates/sp-kernel"]
 resolver = "2"

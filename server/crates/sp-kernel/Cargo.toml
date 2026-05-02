@@ -1,0 +1,15 @@
+[package]
+name = "sp-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.48", features = ["full"] }
+sp-protocol = { path = "../sp-protocol" }
+sp-downstream = { path = "../sp-downstream" }
+rocksdb = "0.20"
+lru = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+jsonwebtoken = "8"
+tracing = "0.1"

@@ -7,19 +7,14 @@
 #![deny(missing_docs)]
 
 mod command;
-mod downstream;
-mod kernel;
-mod persistance;
-mod state;
-mod upstream;
 
+use async_trait::async_trait;
 use crate::command::Commands;
-use crate::downstream::hub::UpdateChannelMessage;
-use crate::downstream::hub::WsHub;
-use crate::kernel::KernelSignal;
-use crate::state::AppState;
+use sp_kernel::{AppState, KernelSignal, PersistenceManager, RoomState, SERVER_ONLY_BUCKET_ID, SyncpondKernel};
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use sp_downstream::{spawn_ws_server, start_downstream, ConnectionEvent, UpdateChannelMessage, WsHub};
+use sp_upstream::{CommandHandler, CommandServer, GrpcServer};
 use std::{fs, net::SocketAddr, sync::Arc};
 
 use tokio::sync::{Mutex, RwLock};
@@ -37,6 +32,151 @@ struct SyncpondConfig {
     require_tls: Option<bool>,
     ws_allowed_origins: Option<Vec<String>>,
     save_dir: Option<String>,
+}
+
+#[derive(Clone)]
+struct KernelCommandHandler {
+    kernel: Arc<SyncpondKernel>,
+}
+
+#[async_trait]
+impl CommandHandler for KernelCommandHandler {
+    async fn new_room(&self, name: String) -> u64 {
+        match self.kernel.handle_command(Commands::NewRoom(name)).await {
+            crate::command::CommandResponse::NewRoomResponse(id) => id,
+            _ => 0,
+        }
+    }
+
+    async fn list_rooms(&self) -> Vec<String> {
+        let app = self.kernel.state.read().await;
+        let ids = app.list_rooms();
+        ids.into_iter()
+            .map(|id| {
+                let label = app.get_room_label(id).unwrap_or_default();
+                format!("{}:{}", id, label)
+            })
+            .collect()
+    }
+
+    async fn delete_room(&self, room_id: u64) -> Result<(), String> {
+        self.kernel.delete_room(room_id).await
+    }
+
+    async fn issue_jwt(&self, room_id: u64, sub: String, buckets: Vec<u64>) -> Result<String, String> {
+        let mut app = self.kernel.state.write().await;
+        app.create_room_token(room_id, &sub, &buckets)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn new_bucket(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), String> {
+        match self.kernel
+            .handle_command(Commands::NewBucket(room_id, bucket_id, label))
+            .await
+        {
+            crate::command::CommandResponse::NewBucketResponse => Ok(()),
+            crate::command::CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
+            _ => Err("new_bucket_failed".to_string()),
+        }
+    }
+
+    async fn delete_bucket(&self, room_id: u64, bucket_id: u64) -> Result<(), String> {
+        match self.kernel
+            .handle_command(Commands::DeleteBucket(room_id, bucket_id))
+            .await
+        {
+            crate::command::CommandResponse::DeleteBucketResponse => Ok(()),
+            crate::command::CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
+            _ => Err("delete_bucket_failed".to_string()),
+        }
+    }
+
+    async fn new_member(&self, room_id: u64, member: String) -> Result<(), String> {
+        match self.kernel
+            .handle_command(Commands::NewMember(room_id, member))
+            .await
+        {
+            crate::command::CommandResponse::NewMemberResponse => Ok(()),
+            crate::command::CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
+            _ => Err("new_member_failed".to_string()),
+        }
+    }
+
+    async fn delete_member(&self, room_id: u64, member: String) -> Result<(), String> {
+        match self.kernel
+            .handle_command(Commands::DeleteMember(room_id, member))
+            .await
+        {
+            crate::command::CommandResponse::DeleteMemberResponse => Ok(()),
+            crate::command::CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
+            _ => Err("delete_member_failed".to_string()),
+        }
+    }
+
+    async fn list_members(&self, room_id: u64) -> Vec<String> {
+        let app = self.kernel.state.read().await;
+        match app.list_members(room_id) {
+            Ok(members) => members,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn list_buckets(&self, room_id: u64) -> Vec<String> {
+        let app = self.kernel.state.read().await;
+        if let Some(room_arc) = app.rooms.get(&room_id) {
+            if let Ok(room) = room_arc.read() {
+                let mut ids: Vec<u64> = room.buckets.keys().copied().collect();
+                ids.sort_unstable();
+                return ids
+                    .into_iter()
+                    .map(|id| {
+                        let label = room.bucket_labels.get(&id).cloned().unwrap_or_default();
+                        format!("{}:{}", id, label)
+                    })
+                    .collect();
+            }
+        }
+
+        Vec::new()
+    }
+
+    async fn read_fragment(&self, room_id: u64, bucket_id: u64, key: String) -> Result<Option<Vec<u8>>, String> {
+        match self
+            .kernel
+            .handle_command(Commands::ReadFragment(room_id, bucket_id, key))
+            .await
+        {
+            crate::command::CommandResponse::FragmentReadResponse(data) => Ok(data),
+            crate::command::CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
+            _ => Ok(None),
+        }
+    }
+
+    async fn write_fragment(&self, room_id: u64, bucket_id: u64, key: String, data: Vec<u8>) -> Result<(), String> {
+        match self
+            .kernel
+            .handle_command(Commands::WriteFragment(room_id, bucket_id, key, data))
+            .await
+        {
+            crate::command::CommandResponse::FragmentWriteResponse => Ok(()),
+            crate::command::CommandResponse::LoadRoomResponse(Err(e)) => Err(e),
+            _ => Err("write_fragment_failed".to_string()),
+        }
+    }
+
+    async fn load_room(&self, room_id: u64) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::LoadRoom(room_id)).await {
+            crate::command::CommandResponse::LoadRoomResponse(result) => result,
+            _ => Err("load_room_failed".to_string()),
+        }
+    }
+
+    async fn unload_room(&self, room_id: u64) -> Result<(), String> {
+        match self.kernel.handle_command(Commands::UnloadRoom(room_id)).await {
+            crate::command::CommandResponse::UnloadRoomResponse(result) => result,
+            _ => Err("unload_room_failed".to_string()),
+        }
+    }
 }
 
 #[tokio::main]
@@ -84,7 +224,7 @@ async fn main() -> Result<()> {
     info!(path = %base_state.save_dir.display(), "save_dir ready for per-room RocksDBs");
 
     // Initialize persistence manager and attempt to open existing room DBs.
-    let persistence = std::sync::Arc::new(crate::persistance::PersistenceManager::new(
+    let persistence = std::sync::Arc::new(PersistenceManager::new(
         base_state.save_dir.clone(),
     ));
     persistence.open_existing_room_dbs().ok();
@@ -96,7 +236,7 @@ async fn main() -> Result<()> {
         for room_id in &existing_rooms {
             base_state.rooms.insert(
                 *room_id,
-                Arc::new(std::sync::RwLock::new(crate::state::RoomState {
+                Arc::new(std::sync::RwLock::new(RoomState {
                     buckets: std::collections::HashMap::new(),
                     room_counter: 0,
                     tx_buffer: None,
@@ -128,6 +268,7 @@ async fn main() -> Result<()> {
     let ws_hub = Arc::new(Mutex::new(WsHub::new(
         notification_rx,
         command_tx.clone(),
+        Arc::new(move |room_id, msg| Commands::WsMessage(room_id, msg)),
     )));
 
     let ws_allowed_origins = config.ws_allowed_origins.clone().unwrap_or_else(|| {
@@ -166,21 +307,32 @@ async fn main() -> Result<()> {
         .with_context(|| format!("invalid upstream_grpc_addr: {}", grpc_addr))?;
 
     // Spawn the websocket server; pass JWT config so downstream doesn't need SharedState.
-    let ws_server = crate::downstream::server::spawn_ws_server(
+    let ws_server = spawn_ws_server(
         ws_addr,
         ws_hub.clone(),
         signal_tx.clone(),
+        Arc::new(|event| match event {
+            ConnectionEvent::ClientConnected {
+                conn_id,
+                requested_buckets,
+            } => KernelSignal::ClientConnected {
+                conn_id,
+                requested_buckets,
+            },
+            ConnectionEvent::ClientDisconnected { conn_id } => KernelSignal::ClientDisconnected { conn_id },
+        }),
         ws_allowed_origins.clone(),
+        SERVER_ONLY_BUCKET_ID,
         config.jwt_key.clone(),
         config.jwt_issuer.clone(),
         config.jwt_audience.clone(),
     );
 
     // Start the downstream forwarder (no docs/health HTTP server).
-    let forwarder = crate::downstream::server::start_downstream(ws_hub.clone()).await?;
+    let forwarder = start_downstream(ws_hub.clone()).await?;
 
     // build the Kernel which coordinates state and downstream components
-    let kernel = Arc::new(crate::kernel::SyncpondKernel::new(
+let kernel = Arc::new(SyncpondKernel::new(
         shared_state.clone(),
         ws_hub.clone(),
         persistence.clone(),
@@ -195,17 +347,16 @@ async fn main() -> Result<()> {
     kernel_for_signals.start_signal_processor(signal_rx);
 
     // start upstream gRPC server for trusted application servers
-    let grpc_state = shared_state.clone();
     let grpc_addr_for_task = grpc_addr.clone();
-    let kernel_for_grpc = kernel.clone();
+    let grpc_handler = Arc::new(KernelCommandHandler { kernel: kernel.clone() });
     let grpc_server = tokio::spawn(async move {
         info!(
             "syncpond upstream gRPC server listening on {}",
             grpc_addr_for_task
         );
-        let server = crate::upstream::GrpcServer::new(
-            crate::upstream::CommandServer::new(kernel_for_grpc),
-            grpc_state,
+        let server = GrpcServer::new(
+            CommandServer::new(grpc_handler),
+            Some(config.command_api_key.clone()),
         );
         server
             .serve(grpc_addr_for_task)
