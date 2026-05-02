@@ -5,45 +5,59 @@ pub type RoomId = u64;
 pub type BucketId = u64;
 pub type FragmentData = Vec<u8>;
 
-/// Commands that can be executed against the kernel/state.
+/// A bucket-scoped update event delivered to downstream subscribers.
+#[derive(Debug, Clone)]
+pub struct DataUpdate {
+    pub bucket_id: u64,
+    pub key: String,
+    pub value: Option<Value>,
+    pub bucket_counter: u64,
+}
+
+/// Notifications sent over the internal downstream update channel.
+pub enum UpdateChannelMessage {
+    Broadcast(DataUpdate),
+    Targeted { conn_id: u64, msg: DataUpdate },
+}
+
+/// Messages emitted by the downstream websocket server back to the kernel.
+#[derive(Debug, Clone)]
+pub enum DownstreamMessage {
+    ClientConnected {
+        conn_id: u64,
+        requested_buckets: Vec<u64>,
+    },
+    ClientDisconnected {
+        conn_id: u64,
+    },
+    WsMessage(RoomId, Vec<u8>),
+}
+
+/// Upstream commands for modifying state or reading fragments.
 #[derive(Debug)]
 pub enum Commands {
-    // Room handling
     NewRoom(RoomName),
-    // Bucket handling
     NewBucket(RoomId, BucketId, String),
     DeleteBucket(RoomId, BucketId),
     NewMember(RoomId, String),
     DeleteMember(RoomId, String),
-
-    // Fragment handling
     WriteFragment(RoomId, BucketId, String, FragmentData),
     ReadFragment(RoomId, BucketId, String),
-    // Load/unload room
     LoadRoom(RoomId),
     UnloadRoom(RoomId),
-    /// Raw message forwarded from a websocket client tied to a room.
-    WsMessage(RoomId, Value),
 }
 
-/// Responses returned by command execution.
+/// Responses returned from command execution.
 #[derive(Debug)]
 pub enum CommandResponse {
-    // Room handling responses
     NewRoomResponse(RoomId),
-
-    // Bucket handling responses
     NewBucketResponse,
     DeleteBucketResponse,
     NewMemberResponse,
     DeleteMemberResponse,
-
-    // Fragment handling responses
     FragmentWriteResponse,
     FragmentReadResponse(Option<FragmentData>),
-    /// Room load/unload responses
     LoadRoomResponse(Result<(), String>),
     UnloadRoomResponse(Result<(), String>),
-    /// Acknowledgement for a websocket-forwarded message.
     WsMessageAck,
 }

@@ -260,7 +260,15 @@ impl AppState {
             let frag_map = fragments.get(id).cloned().unwrap_or_default();
             let entry_map: HashMap<String, FragmentEntry> = frag_map
                 .into_iter()
-                .map(|(key, val)| (key, FragmentEntry { value: val, key_version: 0 }))
+                .map(|(key, val)| {
+                    (
+                        key,
+                        FragmentEntry {
+                            value: val,
+                            key_version: 0,
+                        },
+                    )
+                })
                 .collect();
             room.buckets.insert(*id, entry_map);
         }
@@ -454,13 +462,7 @@ impl AppState {
         room.room_counter += 1;
         let key_version = room.room_counter;
         let bucket_map = room.buckets.entry(bucket_id).or_default();
-        bucket_map.insert(
-            key,
-            FragmentEntry {
-                value,
-                key_version,
-            },
-        );
+        bucket_map.insert(key, FragmentEntry { value, key_version });
 
         Ok(())
     }
@@ -806,13 +808,7 @@ impl AppState {
                     room.room_counter += 1;
                     let key_version = room.room_counter;
                     let bucket_map = room.buckets.entry(bucket_id).or_default();
-                    bucket_map.insert(
-                        key,
-                        FragmentEntry {
-                            value,
-                            key_version,
-                        },
-                    );
+                    bucket_map.insert(key, FragmentEntry { value, key_version });
                 }
                 RoomCommand::Del { bucket_id, key } => {
                     // For semantics, DEL in a transaction always tombstones the key, even if it did
@@ -1289,9 +1285,7 @@ mod tests {
         app.set_jwt_audience("client".to_string());
         let room_id = app.create_room();
 
-        let token = app
-            .create_room_token(room_id, "room:1", &[1u64])
-            .unwrap();
+        let token = app.create_room_token(room_id, "room:1", &[1u64]).unwrap();
         // JWT format: three base64url parts separated by '.'
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts");

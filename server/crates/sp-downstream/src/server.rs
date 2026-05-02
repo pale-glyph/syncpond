@@ -1,20 +1,20 @@
-use crate::downstream::connection::handle_ws_connection;
-use crate::downstream::hub::WsHub;
+use crate::connection::handle_ws_connection;
+use crate::hub::WsHub;
 use anyhow::Context;
+use sp_protocol::DownstreamMessage;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::mpsc;
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, Mutex},
+};
 use tracing::{error, info};
 
-/// Spawn the websocket server and return its JoinHandle.
 pub fn spawn_ws_server(
     ws_addr: SocketAddr,
     ws_hub: Arc<Mutex<WsHub>>,
-    signal_sender: mpsc::Sender<crate::kernel::KernelSignal>,
+    downstream_sender: mpsc::Sender<DownstreamMessage>,
     ws_allowed_origins: Vec<String>,
-    jwt_key: Option<String>,
-    jwt_issuer: Option<String>,
-    jwt_audience: Option<String>,
+    reserved_bucket_id: u64,
 ) -> tokio::task::JoinHandle<anyhow::Result<(), anyhow::Error>> {
     tokio::spawn(async move {
         let listener = TcpListener::bind(ws_addr).await.context("ws bind failed")?;
@@ -23,22 +23,17 @@ pub fn spawn_ws_server(
         loop {
             let (stream, peer) = listener.accept().await?;
             let hub = ws_hub.clone();
-            let signal_sender = signal_sender.clone();
+            let downstream_sender = downstream_sender.clone();
             let ws_allowed_origins_for_conn = ws_allowed_origins.clone();
-            let jwt_key_for_conn = jwt_key.clone();
-            let jwt_issuer_for_conn = jwt_issuer.clone();
-            let jwt_audience_for_conn = jwt_audience.clone();
 
             tokio::spawn(async move {
                 if let Err(err) = handle_ws_connection(
                     stream,
                     peer,
                     hub,
-                    signal_sender,
+                    downstream_sender.clone(),
+                    reserved_bucket_id,
                     ws_allowed_origins_for_conn,
-                    jwt_key_for_conn,
-                    jwt_issuer_for_conn,
-                    jwt_audience_for_conn,
                 )
                 .await
                 {
@@ -52,7 +47,6 @@ pub fn spawn_ws_server(
     })
 }
 
-/// Start only the downstream forwarder (no docs or health HTTP server).
 pub async fn start_downstream(
     ws_hub: Arc<Mutex<WsHub>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<(), anyhow::Error>>> {
