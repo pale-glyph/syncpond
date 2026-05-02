@@ -3,7 +3,10 @@ use crate::hub::WsHub;
 use anyhow::Context;
 use sp_protocol::ConnectionEvent;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::{net::TcpListener, sync::{mpsc, Mutex}};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, Mutex},
+};
 use tracing::{error, info};
 
 pub fn spawn_ws_server<C, S>(

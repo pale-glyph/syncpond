@@ -44,7 +44,7 @@ pub enum Commands {
     ReadFragment(RoomId, BucketId, String),
     LoadRoom(RoomId),
     UnloadRoom(RoomId),
-    WsMessage(RoomId, Value),
+    WsMessage(RoomId, Vec<u8>),
 }
 
 /// Responses returned from command execution.

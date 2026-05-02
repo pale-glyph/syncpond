@@ -1,13 +1,10 @@
-use sp_protocol::{CommandResponse, Commands};
-use sp_downstream::{DataUpdate, UpdateChannelMessage, WsHub};
 use crate::persistance::PersistenceManager;
 use crate::state::SharedState;
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
-use tokio::sync::{mpsc, Mutex};
+use sp_downstream::{DataUpdate, Downstream};
+use sp_protocol::{CommandResponse, Commands};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::mpsc;
 // connection ids are numeric u64 allocated by WsHub
 use tracing::{debug, error, info};
 
@@ -28,23 +25,20 @@ pub enum KernelSignal {
 /// gRPC server can call into.
 pub struct SyncpondKernel {
     pub state: SharedState,
-    pub _ws_hub: Arc<Mutex<WsHub<Commands>>>,
+    pub downstream: Downstream<Commands>,
     pub persistence: Arc<PersistenceManager>,
-    pub notification_sender: mpsc::Sender<UpdateChannelMessage>,
 }
 
 impl SyncpondKernel {
     pub fn new(
         state: SharedState,
-        ws_hub: Arc<Mutex<WsHub<Commands>>>,
+        downstream: Downstream<Commands>,
         persistence: Arc<PersistenceManager>,
-        notification_sender: mpsc::Sender<UpdateChannelMessage>,
     ) -> Self {
         Self {
             state,
-            _ws_hub: ws_hub,
+            downstream,
             persistence,
-            notification_sender,
         }
     }
 
@@ -77,7 +71,8 @@ impl SyncpondKernel {
                             requested_buckets = bucket_count,
                             "client connected"
                         );
-                        self.handle_client_connected(conn_id, requested_buckets).await;
+                        self.handle_client_connected(conn_id, requested_buckets)
+                            .await;
                     }
                     KernelSignal::ClientDisconnected { conn_id } => {
                         info!(conn = conn_id, "client disconnected");
@@ -89,14 +84,11 @@ impl SyncpondKernel {
 
     async fn handle_client_connected(&self, conn_id: u64, requested_buckets: Vec<u64>) {
         // Look up the room this connection belongs to from the hub.
-        let room_id = {
-            let hub = self._ws_hub.lock().await;
-            match hub.get_client_room_id(conn_id) {
-                Some(id) => id,
-                None => {
-                    debug!(conn = conn_id, "handle_client_connected: conn not found in hub, skipping initial sync");
-                    return;
-                }
+        let room_id = match self.downstream.get_client_room_id(conn_id).await {
+            Some(id) => id,
+            None => {
+                debug!(conn = conn_id, "handle_client_connected: conn not found in downstream hub, skipping initial sync");
+                return;
             }
         };
 
@@ -110,7 +102,12 @@ impl SyncpondKernel {
                         if let Some(bucket_map) = room.buckets.get(&bucket_id) {
                             for (key, entry) in bucket_map {
                                 if !entry.value.is_null() {
-                                    out.push((bucket_id, key.clone(), entry.value.clone(), entry.key_version));
+                                    out.push((
+                                        bucket_id,
+                                        key.clone(),
+                                        entry.value.clone(),
+                                        entry.key_version,
+                                    ));
                                 }
                             }
                         }
@@ -134,17 +131,18 @@ impl SyncpondKernel {
                 value: Some(value),
                 bucket_counter: key_version,
             };
-            if let Err(err) = self
-                .notification_sender
-                .send(UpdateChannelMessage::Targeted { conn_id, msg })
-                .await
-            {
+            if let Err(err) = self.downstream.target(conn_id, msg) {
                 error!(conn = conn_id, room = room_id, %err, "initial sync send failed, aborting");
                 return;
             }
         }
 
-        info!(conn = conn_id, room = room_id, fragments = fragment_count, "initial sync complete");
+        info!(
+            conn = conn_id,
+            room = room_id,
+            fragments = fragment_count,
+            "initial sync complete"
+        );
     }
 
     /// Execute a command against the kernel/state and return a response.
@@ -170,7 +168,9 @@ impl SyncpondKernel {
                     let label_trimmed = label.trim().to_string();
                     if let Ok(mut room) = room_arc.write() {
                         if !room.loaded {
-                            return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                            return CommandResponse::LoadRoomResponse(Err(
+                                "room_not_loaded".to_string()
+                            ));
                         }
                         room.buckets.entry(bucket_id).or_insert_with(HashMap::new);
                         room.bucket_flags.entry(bucket_id).or_insert(0u32);
@@ -198,7 +198,9 @@ impl SyncpondKernel {
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     if let Ok(mut room) = room_arc.write() {
                         if !room.loaded {
-                            return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                            return CommandResponse::LoadRoomResponse(Err(
+                                "room_not_loaded".to_string()
+                            ));
                         }
                         room.buckets.remove(&bucket_id);
                         room.bucket_labels.remove(&bucket_id);
@@ -220,7 +222,9 @@ impl SyncpondKernel {
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     if let Ok(mut room) = room_arc.write() {
                         if !room.loaded {
-                            return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                            return CommandResponse::LoadRoomResponse(Err(
+                                "room_not_loaded".to_string()
+                            ));
                         }
                         if !member_trimmed.is_empty() {
                             room.members.insert(member_trimmed.clone());
@@ -241,7 +245,9 @@ impl SyncpondKernel {
                 if let Some(room_arc) = app.rooms.get(&room_id) {
                     if let Ok(mut room) = room_arc.write() {
                         if !room.loaded {
-                            return CommandResponse::LoadRoomResponse(Err("room_not_loaded".to_string()));
+                            return CommandResponse::LoadRoomResponse(Err(
+                                "room_not_loaded".to_string()
+                            ));
                         }
                         room.members.remove(&member_trimmed);
                     }
@@ -268,8 +274,15 @@ impl SyncpondKernel {
                 // apply state mutation
                 {
                     let app = self.state.write().await;
-                    if let Err(err) = app.set_fragment(room_id, bucket_id, key.clone(), parsed.clone()) {
-                        error!(room = room_id, bucket = bucket_id, "set_fragment error: {:?}", err);
+                    if let Err(err) =
+                        app.set_fragment(room_id, bucket_id, key.clone(), parsed.clone())
+                    {
+                        error!(
+                            room = room_id,
+                            bucket = bucket_id,
+                            "set_fragment error: {:?}",
+                            err
+                        );
                     }
                 }
 
@@ -282,7 +295,9 @@ impl SyncpondKernel {
                     };
                     let _ = self.persistence.open_room_db(room_id);
                     if let Some(rp) = self.persistence.room(room_id) {
-                        if let Err(e) = rp.persist_fragment(&bucket_id.to_string(), &key, fragment_val_opt) {
+                        if let Err(e) =
+                            rp.persist_fragment(&bucket_id.to_string(), &key, fragment_val_opt)
+                        {
                             error!(%e, room = room_id, bucket = bucket_id, key = %key, "persistence persist_fragment failed");
                         }
                     } else {
@@ -303,11 +318,8 @@ impl SyncpondKernel {
                     bucket_counter: room_counter,
                 };
 
-                if let Err(err) = self
-                    .notification_sender
-                    .try_send(UpdateChannelMessage::Broadcast(update))
-                {
-                    error!(room = room_id, bucket = bucket_id, %err, "notification channel send failed, dropping update");
+                if let Err(err) = self.downstream.broadcast(update) {
+                    error!(room = room_id, bucket = bucket_id, %err, "downstream broadcast failed, dropping update");
                 }
 
                 CommandResponse::FragmentWriteResponse
@@ -333,7 +345,10 @@ impl SyncpondKernel {
                 // Ensure the room's RocksDB is open.
                 if let Err(e) = self.persistence.open_room_db(room_id) {
                     error!(room = room_id, error = %e, "LoadRoom: failed to open room rocksdb");
-                    return CommandResponse::LoadRoomResponse(Err(format!("db_open_failed: {}", e)));
+                    return CommandResponse::LoadRoomResponse(Err(format!(
+                        "db_open_failed: {}",
+                        e
+                    )));
                 }
 
                 let (bucket_defs, members, fragments) = match self.persistence.room(room_id) {
@@ -344,7 +359,10 @@ impl SyncpondKernel {
                             Ok(f) => f,
                             Err(e) => {
                                 error!(room = room_id, error = %e, "LoadRoom: failed to load fragments");
-                                return CommandResponse::LoadRoomResponse(Err(format!("fragment_load_failed: {}", e)));
+                                return CommandResponse::LoadRoomResponse(Err(format!(
+                                    "fragment_load_failed: {}",
+                                    e
+                                )));
                             }
                         };
                         let defs: Vec<(u64, Option<String>, u32)> = buckets
@@ -353,7 +371,11 @@ impl SyncpondKernel {
                             .collect();
                         (defs, members, fragments)
                     }
-                    None => (Vec::new(), std::collections::HashSet::new(), std::collections::HashMap::new()),
+                    None => (
+                        Vec::new(),
+                        std::collections::HashSet::new(),
+                        std::collections::HashMap::new(),
+                    ),
                 };
 
                 let app = self.state.read().await;

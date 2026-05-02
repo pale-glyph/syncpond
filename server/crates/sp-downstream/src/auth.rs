@@ -1,4 +1,4 @@
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,16 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Claims {
     pub sub: String,
     pub room_id: Option<u64>,
-    pub buckets: Option<Vec<u64>>, 
+    pub buckets: Option<Vec<u64>>,
     pub exp: usize,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AuthMessage {
-    #[serde(rename = "type")]
-    pub typ: String,
-    pub jwt: String,
-    pub last_seen_counter: Option<u64>,
 }
 
 pub fn validate_jwt_claims(
@@ -39,8 +31,12 @@ pub fn validate_jwt_claims(
         validation.set_audience(&[audience]);
     }
 
-    let token_data = decode::<Claims>(token, &DecodingKey::from_secret(jwt_key.as_ref()), &validation)
-        .map_err(|e| format!("invalid_jwt:{}", e))?;
+    let token_data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(jwt_key.as_ref()),
+        &validation,
+    )
+    .map_err(|e| format!("invalid_jwt:{}", e))?;
 
     let claims = token_data.claims;
     let now = SystemTime::now()

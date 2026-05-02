@@ -1,6 +1,11 @@
-use serde_json::{json, Value};
+use crate::proto::{DataUpdate as ProtoDataUpdate, WsEnvelope};
+use prost::Message;
+use serde_json;
 use sp_protocol::{DataUpdate, UpdateChannelMessage};
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, warn};
 
@@ -10,7 +15,7 @@ pub const MAX_WS_PENDING_MESSAGES: usize = 256;
 pub struct ClientInfo {
     pub room_id: u64,
     pub buckets: HashSet<u64>,
-    pub sender: mpsc::Sender<Value>,
+    pub sender: mpsc::Sender<Vec<u8>>,
 }
 
 pub struct WsHub<C> {
@@ -19,7 +24,7 @@ pub struct WsHub<C> {
     buckets: HashMap<u64, HashSet<u64>>,
     notification_receiver: Option<mpsc::Receiver<UpdateChannelMessage>>,
     command_sender: mpsc::Sender<C>,
-    command_factory: Arc<dyn Fn(u64, Value) -> C + Send + Sync>,
+    command_factory: Arc<dyn Fn(u64, Vec<u8>) -> C + Send + Sync>,
 }
 
 impl<C> WsHub<C>
@@ -29,7 +34,7 @@ where
     pub fn new(
         notification_receiver: mpsc::Receiver<UpdateChannelMessage>,
         command_sender: mpsc::Sender<C>,
-        command_factory: Arc<dyn Fn(u64, Value) -> C + Send + Sync>,
+        command_factory: Arc<dyn Fn(u64, Vec<u8>) -> C + Send + Sync>,
     ) -> Self {
         Self {
             next_conn_id: 1,
@@ -56,7 +61,7 @@ where
         conn_id: u64,
         room_id: u64,
         allowed_buckets: HashSet<u64>,
-        sender: mpsc::Sender<Value>,
+        sender: mpsc::Sender<Vec<u8>>,
     ) -> Result<(), &'static str> {
         for bucket in allowed_buckets.iter() {
             if let Some(conn_set) = self.buckets.get(bucket) {
@@ -100,34 +105,38 @@ where
         }
     }
 
-    pub async fn process_client_message(&self, conn_id: u64, msg: Value) {
+    pub async fn process_client_message(&self, conn_id: u64, msg: Vec<u8>) {
         if let Some(client) = self.connections.get(&conn_id) {
             let cmd = (self.command_factory)(client.room_id, msg);
             if let Err(err) = self.command_sender.send(cmd).await {
                 warn!(client = conn_id, %err, "ws client command channel closed");
             }
         } else {
-            warn!(client = conn_id, "ws client message dropped: unknown connection");
+            warn!(
+                client = conn_id,
+                "ws client message dropped: unknown connection"
+            );
         }
     }
 
-    fn update_event(update: &DataUpdate) -> Value {
-        if update.value.is_some() {
-            json!({
-                "type": "update",
-                "bucket_id": update.bucket_id,
-                "bucket_counter": update.bucket_counter,
-                "key": update.key,
-                "value": update.value,
-            })
-        } else {
-            json!({
-                "type": "delete",
-                "bucket_id": update.bucket_id,
-                "bucket_counter": update.bucket_counter,
-                "key": update.key,
-            })
-        }
+    fn update_event(update: &DataUpdate) -> Vec<u8> {
+        let proto_update = ProtoDataUpdate {
+            bucket_id: update.bucket_id,
+            key: update.key.clone(),
+            value: update
+                .value
+                .as_ref()
+                .and_then(|value| serde_json::to_vec(value).ok())
+                .unwrap_or_default(),
+            bucket_counter: update.bucket_counter,
+            deleted: update.value.is_none(),
+        };
+
+        let envelope = WsEnvelope {
+            payload: Some(crate::proto::ws_envelope::Payload::DataUpdate(proto_update)),
+        };
+
+        envelope.encode_to_vec()
     }
 
     pub async fn send_targeted_update(&mut self, client_id: &u64, update: &DataUpdate) -> bool {
@@ -162,7 +171,10 @@ where
         }
     }
 
-    pub async fn run_forwarder(ws_hub: Arc<Mutex<WsHub<C>>>, mut rx: mpsc::Receiver<UpdateChannelMessage>) {
+    pub async fn run_forwarder(
+        ws_hub: Arc<Mutex<WsHub<C>>>,
+        mut rx: mpsc::Receiver<UpdateChannelMessage>,
+    ) {
         while let Some(msg) = rx.recv().await {
             let mut hub = ws_hub.lock().await;
             match msg {

@@ -14,15 +14,31 @@ pub trait CommandHandler: Send + Sync + 'static {
     async fn new_room(&self, name: String) -> u64;
     async fn list_rooms(&self) -> Vec<String>;
     async fn delete_room(&self, room_id: u64) -> Result<(), String>;
-    async fn issue_jwt(&self, room_id: u64, sub: String, buckets: Vec<u64>) -> Result<String, String>;
+    async fn issue_jwt(
+        &self,
+        room_id: u64,
+        sub: String,
+        buckets: Vec<u64>,
+    ) -> Result<String, String>;
     async fn new_bucket(&self, room_id: u64, bucket_id: u64, label: String) -> Result<(), String>;
     async fn delete_bucket(&self, room_id: u64, bucket_id: u64) -> Result<(), String>;
     async fn new_member(&self, room_id: u64, member: String) -> Result<(), String>;
     async fn delete_member(&self, room_id: u64, member: String) -> Result<(), String>;
     async fn list_members(&self, room_id: u64) -> Vec<String>;
     async fn list_buckets(&self, room_id: u64) -> Vec<String>;
-    async fn read_fragment(&self, room_id: u64, bucket_id: u64, key: String) -> Result<Option<Vec<u8>>, String>;
-    async fn write_fragment(&self, room_id: u64, bucket_id: u64, key: String, data: Vec<u8>) -> Result<(), String>;
+    async fn read_fragment(
+        &self,
+        room_id: u64,
+        bucket_id: u64,
+        key: String,
+    ) -> Result<Option<Vec<u8>>, String>;
+    async fn write_fragment(
+        &self,
+        room_id: u64,
+        bucket_id: u64,
+        key: String,
+        data: Vec<u8>,
+    ) -> Result<(), String>;
     async fn load_room(&self, room_id: u64) -> Result<(), String>;
     async fn unload_room(&self, room_id: u64) -> Result<(), String>;
 }
@@ -68,14 +84,18 @@ impl CommandService for CommandServiceImpl {
         request: Request<proto::IssueJwtRequest>,
     ) -> Result<Response<proto::IssueJwtResponse>, Status> {
         let req = request.into_inner();
-        match self.inner.issue_jwt(req.room_id, req.sub, req.buckets).await {
+        match self
+            .inner
+            .issue_jwt(req.room_id, req.sub, req.buckets)
+            .await
+        {
             Ok(jwt) => Ok(Response::new(proto::IssueJwtResponse { jwt })),
             Err(e) => match e.as_str() {
                 "room_not_found" => Err(Status::not_found(e)),
                 "reserved_bucket_id" | "invalid_member" => Err(Status::invalid_argument(e)),
-                "jwt_key_not_configured" | "jwt_key_too_short" | "jwt_issuer_audience_not_configured" => {
-                    Err(Status::failed_precondition(e))
-                }
+                "jwt_key_not_configured"
+                | "jwt_key_too_short"
+                | "jwt_issuer_audience_not_configured" => Err(Status::failed_precondition(e)),
                 _ => Err(Status::internal(e)),
             },
         }
@@ -157,8 +177,14 @@ impl CommandService for CommandServiceImpl {
             .read_fragment(req.room_id, req.bucket_id, req.key)
             .await
         {
-            Ok(Some(data)) => Ok(Response::new(proto::ReadFragmentResponse { data, found: true })),
-            Ok(None) => Ok(Response::new(proto::ReadFragmentResponse { data: vec![], found: false })),
+            Ok(Some(data)) => Ok(Response::new(proto::ReadFragmentResponse {
+                data,
+                found: true,
+            })),
+            Ok(None) => Ok(Response::new(proto::ReadFragmentResponse {
+                data: vec![],
+                found: false,
+            })),
             Err(e) => Err(map_room_error(&e)),
         }
     }
@@ -239,7 +265,9 @@ impl GrpcServer {
         let api_key = self.api_key.clone();
 
         let svc = CommandServiceServer::with_interceptor(
-            CommandServiceImpl { inner: self.inner.clone() },
+            CommandServiceImpl {
+                inner: self.inner.clone(),
+            },
             move |req: Request<()>| {
                 if let Some(ref configured_key) = api_key {
                     if let Some(val) = req.metadata().get("x-syncpond-command-api-key") {
@@ -255,7 +283,8 @@ impl GrpcServer {
             },
         );
 
-        const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/syncpond_descriptor.pb"));
+        const DESCRIPTOR_SET: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/syncpond_descriptor.pb"));
 
         let reflection = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(DESCRIPTOR_SET)
