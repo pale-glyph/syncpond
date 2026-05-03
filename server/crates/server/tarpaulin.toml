@@ -1,8 +1,0 @@
-[default]
-# Run unit tests only (skip integration tests that need a running server)
-test-threads = 2
-# Exclude generated build artefacts and the main binary entry point (not testable in isolation)
-exclude-files = ["src/main.rs"]
-# Output formats for CI
-out = ["Html", "Lcov"]
-output-dir = "coverage"

@@ -33,7 +33,7 @@ pub enum DownstreamMessage {
     WsMessage(RoomId, Vec<u8>),
 }
 
-/// Upstream commands for modifying state or reading fragments.
+/// Commands for modifying state or reading fragments.
 #[derive(Debug)]
 pub enum Commands {
     NewRoom(RoomName),
@@ -43,8 +43,6 @@ pub enum Commands {
     DeleteMember(RoomId, String),
     WriteFragment(RoomId, BucketId, String, FragmentData),
     ReadFragment(RoomId, BucketId, String),
-    LoadRoom(RoomId),
-    UnloadRoom(RoomId),
 }
 
 /// Responses returned from command execution.
@@ -57,7 +55,5 @@ pub enum CommandResponse {
     DeleteMemberResponse,
     FragmentWriteResponse,
     FragmentReadResponse(Option<FragmentData>),
-    LoadRoomResponse(Result<(), String>),
-    UnloadRoomResponse(Result<(), String>),
     WsMessageAck,
 }

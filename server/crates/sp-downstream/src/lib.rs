@@ -86,8 +86,4 @@ impl Downstream {
     }
 }
 
-mod proto {
-    tonic::include_proto!("syncpond_downstream");
-}
-
 pub use sp_protocol::{DownstreamMessage, DataUpdate};

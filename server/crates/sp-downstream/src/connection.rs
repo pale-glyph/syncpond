@@ -1,9 +1,9 @@
 use crate::auth::AuthConfig;
 use crate::hub::{WsHub, MAX_WS_PENDING_MESSAGES};
-use crate::proto::{AuthError, AuthOk, WsEnvelope};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use prost::Message;
+use serde::Deserialize;
+use serde_json::json;
 use sp_protocol::DownstreamMessage;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{
@@ -13,6 +13,18 @@ use tokio::{
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
+
+#[derive(Debug, Deserialize)]
+struct AuthFrame {
+    #[serde(rename = "type")]
+    msg_type: String,
+    jwt: String,
+    last_seen_counter: Option<u64>,
+}
+
+fn send_json(msg: serde_json::Value) -> WsMessage {
+    WsMessage::Text(msg.to_string())
+}
 
 pub async fn handle_ws_connection(
     stream: TcpStream,
@@ -53,64 +65,47 @@ pub async fn handle_ws_connection(
         tokio_tungstenite::accept_async(stream).await?
     };
     info!(%peer, "websocket connection established");
-    debug!(%peer, allowed_origins = ws_allowed_origins.len(), "ws accept details");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    let auth_frame = match ws_receiver.next().await {
-        Some(Ok(WsMessage::Binary(bin))) => {
-            debug!(%peer, bin_len = bin.len(), "received auth frame");
-            match WsEnvelope::decode(bin.as_slice()) {
-                Ok(envelope) => envelope,
-                Err(_) => {
-                    warn!(%peer, reason = "invalid_auth_frame", "ws auth failure");
-                    let err = WsEnvelope {
-                        payload: Some(crate::proto::ws_envelope::Payload::AuthError(AuthError {
-                            reason: "invalid_auth_frame".to_string(),
-                            detail: "failed to decode protobuf auth message".to_string(),
-                        })),
-                    };
-                    ws_sender
-                        .send(WsMessage::Binary(err.encode_to_vec()))
-                        .await
-                        .ok();
-                    return Ok(());
+    // Read the first text frame as the auth message.
+    let auth_msg: AuthFrame = loop {
+        match ws_receiver.next().await {
+            Some(Ok(WsMessage::Text(txt))) => {
+                match serde_json::from_str::<AuthFrame>(&txt) {
+                    Ok(frame) if frame.msg_type == "auth" => break frame,
+                    Ok(_) => {
+                        warn!(%peer, reason = "expected_auth_type", "ws auth failure");
+                        ws_sender
+                            .send(send_json(json!({"type":"auth_error","reason":"expected_auth_type"})))
+                            .await
+                            .ok();
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        warn!(%peer, reason = "invalid_auth_frame", "ws auth failure");
+                        ws_sender
+                            .send(send_json(json!({"type":"auth_error","reason":"invalid_auth_frame"})))
+                            .await
+                            .ok();
+                        return Ok(());
+                    }
                 }
             }
-        }
-        Some(Ok(_)) => {
-            warn!(%peer, reason = "invalid_auth_message", "ws auth failure");
-            let err = WsEnvelope {
-                payload: Some(crate::proto::ws_envelope::Payload::AuthError(AuthError {
-                    reason: "invalid_auth_message".to_string(),
-                    detail: "expected binary protobuf authentication frame".to_string(),
-                })),
-            };
-            ws_sender
-                .send(WsMessage::Binary(err.encode_to_vec()))
-                .await
-                .ok();
-            return Ok(());
-        }
-        Some(Err(err)) => return Err(err.into()),
-        None => return Ok(()),
-    };
-
-    let auth_msg = match auth_frame.payload {
-        Some(crate::proto::ws_envelope::Payload::Auth(auth)) => auth,
-        _ => {
-            warn!(%peer, reason = "missing_auth", "ws auth failure");
-            let err = WsEnvelope {
-                payload: Some(crate::proto::ws_envelope::Payload::AuthError(AuthError {
-                    reason: "missing_auth".to_string(),
-                    detail: "expected Auth payload in first frame".to_string(),
-                })),
-            };
-            ws_sender
-                .send(WsMessage::Binary(err.encode_to_vec()))
-                .await
-                .ok();
-            return Ok(());
+            Some(Ok(WsMessage::Ping(payload))) => {
+                ws_sender.send(WsMessage::Pong(payload)).await.ok();
+                continue;
+            }
+            Some(Ok(_)) => {
+                warn!(%peer, reason = "expected_text_auth", "ws auth failure");
+                ws_sender
+                    .send(send_json(json!({"type":"auth_error","reason":"expected_text_auth_frame"})))
+                    .await
+                    .ok();
+                return Ok(());
+            }
+            Some(Err(err)) => return Err(err.into()),
+            None => return Ok(()),
         }
     };
 
@@ -123,14 +118,8 @@ pub async fn handle_ws_connection(
         }
         Err(reason) => {
             warn!(%peer, %reason, "ws auth failure: invalid_jwt");
-            let err = WsEnvelope {
-                payload: Some(crate::proto::ws_envelope::Payload::AuthError(AuthError {
-                    reason: "invalid_jwt".to_string(),
-                    detail: reason,
-                })),
-            };
             ws_sender
-                .send(WsMessage::Binary(err.encode_to_vec()))
+                .send(send_json(json!({"type":"auth_error","reason":"invalid_jwt","detail":reason})))
                 .await
                 .ok();
             return Ok(());
@@ -147,14 +136,8 @@ pub async fn handle_ws_connection(
         Some(id) if id > 0 => id,
         _ => {
             warn!(%peer, reason = "invalid_jwt_missing_room_id", "ws auth failure");
-            let err = WsEnvelope {
-                payload: Some(crate::proto::ws_envelope::Payload::AuthError(AuthError {
-                    reason: "invalid_jwt_missing_room_id".to_string(),
-                    detail: "token missing room_id claim".to_string(),
-                })),
-            };
             ws_sender
-                .send(WsMessage::Binary(err.encode_to_vec()))
+                .send(send_json(json!({"type":"auth_error","reason":"invalid_jwt_missing_room_id"})))
                 .await
                 .ok();
             return Ok(());
@@ -162,15 +145,9 @@ pub async fn handle_ws_connection(
     };
 
     let room_counter = 0u64;
-    let auth_ok = WsEnvelope {
-        payload: Some(crate::proto::ws_envelope::Payload::AuthOk(AuthOk {
-            room_counter,
-        })),
-    };
-
     debug!(%peer, "sending auth_ok");
     ws_sender
-        .send(WsMessage::Binary(auth_ok.encode_to_vec()))
+        .send(send_json(json!({"type":"auth_ok","room_counter":room_counter})))
         .await?;
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_WS_PENDING_MESSAGES);
@@ -181,14 +158,8 @@ pub async fn handle_ws_connection(
         match hub.add_client(conn_id, room_id, allowed_buckets.clone(), tx.clone()) {
             Ok(()) => conn_id,
             Err(reason) => {
-                let err = WsEnvelope {
-                    payload: Some(crate::proto::ws_envelope::Payload::AuthError(AuthError {
-                        reason: "client_add_failed".to_string(),
-                        detail: reason.to_string(),
-                    })),
-                };
                 ws_sender
-                    .send(WsMessage::Binary(err.encode_to_vec()))
+                    .send(send_json(json!({"type":"auth_error","reason":"client_add_failed","detail":reason})))
                     .await
                     .ok();
                 return Ok(());
@@ -203,15 +174,14 @@ pub async fn handle_ws_connection(
         })
         .ok();
 
-    info!(%peer, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client added");
-    info!(%peer, "ws client authenticated and added");
+    info!(%peer, conn_id = conn_id, allowed_buckets = allowed_buckets.len(), "ws client authenticated");
 
     loop {
         tokio::select! {
             msg = ws_receiver.next() => {
                 match msg {
                     Some(Ok(WsMessage::Ping(payload))) => {
-                        debug!(%peer, ping_len = payload.len(), "received ping");
+                        debug!(%peer, "received ping");
                         ws_sender.send(WsMessage::Pong(payload)).await.ok();
                     }
                     Some(Ok(WsMessage::Pong(_))) => {
@@ -222,41 +192,15 @@ pub async fn handle_ws_connection(
                         ws_sender.close().await.ok();
                         break;
                     }
-                    Some(Ok(WsMessage::Text(_txt))) => {
-                        warn!(%peer, "ws text message not supported after handshake");
-                        let err = WsEnvelope {
-                            payload: Some(crate::proto::ws_envelope::Payload::AuthError(AuthError {
-                                reason: "unsupported_message_format".to_string(),
-                                detail: "text frames are not supported after auth".to_string(),
-                            })),
-                        };
-                        ws_sender.send(WsMessage::Binary(err.encode_to_vec())).await.ok();
+                    Some(Ok(WsMessage::Text(txt))) => {
+                        debug!(%peer, "ws text message received");
+                        let hub = ws_hub.lock().await;
+                        hub.process_client_message(conn_id, txt.into_bytes()).await;
                     }
                     Some(Ok(WsMessage::Binary(bin))) => {
-                        debug!(%peer, bin_len = bin.len(), "ws binary message received");
-                        match WsEnvelope::decode(bin.as_slice()) {
-                            Ok(envelope) => {
-                                match envelope.payload {
-                                    Some(crate::proto::ws_envelope::Payload::ClientCommand(cmd)) => {
-                                        let hub = ws_hub.lock().await;
-                                        hub.process_client_message(conn_id, cmd.payload).await;
-                                    }
-                                    _ => {
-                                        warn!(%peer, "unsupported ws frame payload");
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                warn!(%peer, ?err, "invalid ws protobuf frame");
-                                let err_frame = WsEnvelope {
-                                    payload: Some(crate::proto::ws_envelope::Payload::AuthError(AuthError {
-                                        reason: "invalid_frame".to_string(),
-                                        detail: "failed to decode protobuf frame".to_string(),
-                                    })),
-                                };
-                                ws_sender.send(WsMessage::Binary(err_frame.encode_to_vec())).await.ok();
-                            }
-                        }
+                        debug!(%peer, "ws binary message received");
+                        let hub = ws_hub.lock().await;
+                        hub.process_client_message(conn_id, bin).await;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(err)) => {
@@ -269,8 +213,10 @@ pub async fn handle_ws_connection(
             event = rx.recv() => {
                 match event {
                     Some(event) => {
+                        // events are JSON bytes; send as text
+                        let text = String::from_utf8_lossy(&event).into_owned();
                         debug!(%peer, "forwarding event to ws client");
-                        if let Err(err) = ws_sender.send(WsMessage::Binary(event)).await {
+                        if let Err(err) = ws_sender.send(WsMessage::Text(text)).await {
                             error!(%err, "ws outgoing error");
                             break;
                         }

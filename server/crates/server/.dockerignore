@@ -1,8 +1,0 @@
-target
-**/*.rs.bk
-**/*~
-**/.git
-**/.idea
-**/.vscode
-# Cargo.lock is needed for reproducible builds in Docker
-#Cargo.lock

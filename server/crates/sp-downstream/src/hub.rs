@@ -1,5 +1,3 @@
-use crate::proto::{DataUpdate as ProtoDataUpdate, WsEnvelope};
-use prost::Message;
 use serde_json;
 use sp_protocol::{DataUpdate, DownstreamMessage, UpdateChannelMessage};
 use std::{
@@ -114,23 +112,15 @@ impl WsHub {
     }
 
     fn update_event(update: &DataUpdate) -> Vec<u8> {
-        let proto_update = ProtoDataUpdate {
-            bucket_id: update.bucket_id,
-            key: update.key.clone(),
-            value: update
-                .value
-                .as_ref()
-                .and_then(|value| serde_json::to_vec(value).ok())
-                .unwrap_or_default(),
-            bucket_counter: update.bucket_counter,
-            deleted: update.value.is_none(),
-        };
-
-        let envelope = WsEnvelope {
-            payload: Some(crate::proto::ws_envelope::Payload::DataUpdate(proto_update)),
-        };
-
-        envelope.encode_to_vec()
+        let msg = serde_json::json!({
+            "type": "update",
+            "bucket_id": update.bucket_id,
+            "key": update.key,
+            "value": update.value,
+            "deleted": update.value.is_none(),
+            "bucket_counter": update.bucket_counter,
+        });
+        serde_json::to_vec(&msg).unwrap_or_default()
     }
 
     pub async fn send_targeted_update(&mut self, client_id: &u64, update: &DataUpdate) -> bool {
